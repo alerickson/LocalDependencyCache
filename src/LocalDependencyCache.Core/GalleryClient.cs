@@ -1,14 +1,19 @@
 using System.Globalization;
 using System.Net;
-using System.Runtime.CompilerServices;
 using System.Xml;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace LocalDependencyCache.Core;
 
+/// <summary>
+/// Reads package metadata from the PowerShell Gallery OData Search() endpoint. Every query sends
+/// $filter, $orderby, $skip, and $top together; the Gallery rejects some other operator combinations.
+/// </summary>
 public sealed class GalleryClient : IGalleryClient
 {
+    private const int MaxPageSize = 100;
+
     private readonly HttpClient _httpClient;
     private readonly SyncSettings _settings;
     private readonly ILogger<GalleryClient> _logger;
@@ -20,61 +25,55 @@ public sealed class GalleryClient : IGalleryClient
         _logger = logger;
     }
 
-    /// <summary>
-    /// Streams packages published after <paramref name="checkpointUtc"/>, oldest first, one page at a time.
-    /// Paging advances a Published cursor instead of growing $skip, so deep full syncs stay cheap.
-    /// Packages published in the same second as a page boundary can be returned twice; callers upsert.
-    /// </summary>
-    public async IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(
-        DateTimeOffset checkpointUtc,
-        int pageSize,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<PackageEntry>> GetTopPackagesAsync(int count, CancellationToken cancellationToken)
     {
-        var effectivePageSize = pageSize > 0 ? pageSize : _settings.PageSize;
-        var cursor = TruncateToSecond(checkpointUtc);
-        var inclusive = false;
-        var skip = 0;
+        var results = new List<PackageEntry>();
+        while (results.Count < count)
+        {
+            var top = Math.Min(PageSize, count - results.Count);
+            var page = await GetPageWithRetryAsync(
+                BuildRequestUri("IsLatestVersion", "DownloadCount desc", results.Count, top, includePrerelease: false),
+                cancellationToken);
+            results.AddRange(page);
 
+            if (page.Count < top)
+            {
+                break;
+            }
+        }
+
+        _logger.LogInformation("Fetched the top {Count} packages by download count.", results.Count);
+        return results;
+    }
+
+    public async Task<PackageEntry?> GetLatestVersionAsync(string packageId, CancellationToken cancellationToken)
+    {
+        var page = await GetPageWithRetryAsync(
+            BuildRequestUri($"Id eq {QuoteLiteral(packageId)} and IsLatestVersion", "Published desc", 0, 1, includePrerelease: false),
+            cancellationToken);
+        return page.Count > 0 ? page[0] : null;
+    }
+
+    public async Task<IReadOnlyList<PackageEntry>> GetAllVersionsAsync(string packageId, CancellationToken cancellationToken)
+    {
+        var results = new List<PackageEntry>();
         while (true)
         {
-            var requestUri = BuildRequestUri(cursor, inclusive, skip, effectivePageSize);
-            var page = await GetPageWithRetryAsync(requestUri, cancellationToken);
+            var page = await GetPageWithRetryAsync(
+                BuildRequestUri($"Id eq {QuoteLiteral(packageId)}", "Published", results.Count, PageSize, includePrerelease: true),
+                cancellationToken);
+            results.AddRange(page);
 
-            _logger.LogInformation(
-                "Fetched {PackageCount} packages from gallery (Published {Operator} {Cursor:O}, skip {Skip}).",
-                page.Count, inclusive ? "ge" : "gt", cursor, skip);
-
-            if (page.Count > 0)
+            if (page.Count < PageSize)
             {
-                yield return page;
-            }
-
-            if (page.Count < effectivePageSize)
-            {
-                yield break;
-            }
-
-            var lastPublished = page[^1].PublishedUtc;
-            if (lastPublished is null)
-            {
-                skip += effectivePageSize;
-                continue;
-            }
-
-            var lastSecond = TruncateToSecond(lastPublished.Value);
-            if (inclusive && lastSecond == cursor)
-            {
-                // The whole page shares one second; step past it with $skip to guarantee progress.
-                skip += effectivePageSize;
-            }
-            else
-            {
-                cursor = lastSecond;
-                inclusive = true;
-                skip = 0;
+                return results;
             }
         }
     }
+
+    private int PageSize => _settings.PageSize is > 0 and <= MaxPageSize ? _settings.PageSize : MaxPageSize;
+
+    private static string QuoteLiteral(string value) => "'" + value.Replace("'", "''") + "'";
 
     private async Task<IReadOnlyList<PackageEntry>> GetPageWithRetryAsync(Uri requestUri, CancellationToken cancellationToken)
     {
@@ -152,25 +151,18 @@ public sealed class GalleryClient : IGalleryClient
             _ => false
         };
 
-    private static DateTimeOffset TruncateToSecond(DateTimeOffset value)
+    private Uri BuildRequestUri(string filter, string orderBy, int skip, int top, bool includePrerelease)
     {
-        var utc = value.ToUniversalTime();
-        return new DateTimeOffset(utc.Ticks - utc.Ticks % TimeSpan.TicksPerSecond, TimeSpan.Zero);
-    }
-
-    private Uri BuildRequestUri(DateTimeOffset cursorUtc, bool inclusive, int skip, int pageSize)
-    {
-        var comparison = inclusive ? "ge" : "gt";
         var builder = new UriBuilder(_settings.GalleryEndpoint)
         {
             Query = string.Join('&',
                 new[]
                 {
-                    ("$filter", $"Published {comparison} datetime'{cursorUtc.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)}'"),
-                    ("$orderby", "Published"),
+                    ("$filter", filter),
+                    ("$orderby", orderBy),
                     ("$skip", skip.ToString(CultureInfo.InvariantCulture)),
-                    ("$top", pageSize.ToString(CultureInfo.InvariantCulture)),
-                    ("includePrerelease", "true")
+                    ("$top", top.ToString(CultureInfo.InvariantCulture)),
+                    ("includePrerelease", includePrerelease ? "true" : "false")
                 }
                 .Select(pair => $"{WebUtility.UrlEncode(pair.Item1)}={WebUtility.UrlEncode(pair.Item2)}"))
         };

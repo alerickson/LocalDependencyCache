@@ -27,8 +27,7 @@ public sealed class PackageCacheSyncServiceTests
 
             var publishedUtc = DateTimeOffset.Parse("2026-06-04T11:00:06Z");
             var service = new PackageCacheSyncService(
-                new StubGalleryClient(new[]
-                {
+                new FakeGalleryClient().WithTop(
                     PackageEntry.Create(
                         "Sample.Module",
                         "1.2.3",
@@ -41,8 +40,7 @@ public sealed class PackageCacheSyncServiceTests
                         publishedUtc.AddMinutes(5),
                         false,
                         new[] { "PSCommand_Get-Sample", "Demo" },
-                        "Other.Module:[1.0.0,2.0.0)")
-                }),
+                        "Other.Module:[1.0.0,2.0.0)")),
                 new FileSystemArtifactStore(rootPath, "latest/psgallery-cache.zip", "latest/psgallery-cache.manifest.json", "https://cdn.example.test/cache"),
                 settings,
                 new FakeClock(DateTimeOffset.Parse("2026-06-04T12:00:00Z")),
@@ -54,7 +52,7 @@ public sealed class PackageCacheSyncServiceTests
             Assert.NotNull(result.Manifest);
             Assert.NotNull(result.ArtifactVersion);
 
-            Assert.Equal(1, result.ProcessedPackages);
+            Assert.Equal(1, result.PackageCount);
             Assert.NotEmpty(result.Manifest.ArtifactUrl);
             Assert.EndsWith(".zip", result.ArtifactPath, StringComparison.OrdinalIgnoreCase);
             Assert.EndsWith(".zip", result.Manifest.ArtifactUrl, StringComparison.OrdinalIgnoreCase);
@@ -90,22 +88,6 @@ public sealed class PackageCacheSyncServiceTests
         }
     }
 
-    private sealed class StubGalleryClient : IGalleryClient
-    {
-        private readonly IReadOnlyList<PackageEntry> _packages;
-
-        public StubGalleryClient(IReadOnlyList<PackageEntry> packages)
-        {
-            _packages = packages;
-        }
-
-        public async IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            await Task.Yield();
-            yield return _packages;
-        }
-    }
-
     [Fact]
     public async Task RunAsync_handles_dependency_without_version_range()
     {
@@ -126,9 +108,7 @@ public sealed class PackageCacheSyncServiceTests
 
             var publishedUtc = DateTimeOffset.Parse("2026-06-04T11:00:06Z");
             var service = new PackageCacheSyncService(
-                new StubGalleryClient(new[]
-                {
-                    PackageEntry.Create(
+                new FakeGalleryClient().WithTop(PackageEntry.Create(
                         "No.Range.Package",
                         "1.0.0",
                         "1.0.0",
@@ -140,8 +120,7 @@ public sealed class PackageCacheSyncServiceTests
                         publishedUtc,
                         false,
                         new[] { "Demo" },
-                        "Any.Dependency")
-                }),
+                        "Any.Dependency")),
                 new FileSystemArtifactStore(rootPath, "latest/psgallery-cache.zip", "latest/psgallery-cache.manifest.json", "https://cdn.example.test/cache"),
                 settings,
                 new FakeClock(DateTimeOffset.Parse("2026-06-04T12:00:00Z")),
@@ -150,7 +129,7 @@ public sealed class PackageCacheSyncServiceTests
             var result = await service.RunAsync(CancellationToken.None);
 
             Assert.NotNull(result);
-            Assert.Equal(1, result.ProcessedPackages);
+            Assert.Equal(1, result.PackageCount);
 
             var dbPath = Path.Combine(rootPath, "psgallery-cache.sqlite");
             using var connection = new SqliteConnection($"Data Source={dbPath};Pooling=False");

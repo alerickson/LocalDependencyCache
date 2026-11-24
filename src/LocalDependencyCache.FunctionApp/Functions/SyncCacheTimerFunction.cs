@@ -27,18 +27,21 @@ public sealed class SyncCacheTimerFunction
         if (result is null)
         {
             _logger.LogWarning("Sync skipped: another run holds the sync lock.");
+            return;
         }
-        else if (!result.Published)
+
+        if (result.UnresolvedDependencies.Count > 0)
         {
-            _logger.LogInformation("Sync found no package changes; nothing published. Fetched: {Packages}. Checkpoint: {Checkpoint}.", result.ProcessedPackages, result.CheckpointUtc);
+            _logger.LogWarning("{Count} dependencies could not be resolved: {Dependencies}.", result.UnresolvedDependencies.Count, string.Join("; ", result.UnresolvedDependencies));
         }
-        else if (result.IsComplete)
+
+        if (result.Published)
         {
-            _logger.LogInformation("Sync completed. Packages: {Packages}. Artifact version: {Version}.", result.ProcessedPackages, result.ArtifactVersion);
+            _logger.LogInformation("Sync published {Version}: {Packages} package versions ({Top} top packages).", result.ArtifactVersion, result.PackageCount, result.TopPackageCount);
         }
         else
         {
-            _logger.LogWarning("Sync stopped at its time budget and published partial progress. Packages: {Packages}. Checkpoint: {Checkpoint}. The next run continues.", result.ProcessedPackages, result.CheckpointUtc);
+            _logger.LogInformation("Sync found no content changes; nothing published. Package versions: {Packages}.", result.PackageCount);
         }
     }
 }

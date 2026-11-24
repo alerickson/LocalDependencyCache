@@ -8,6 +8,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
+var runOnce = args.Any(argument => string.Equals(argument, "--run-once", StringComparison.OrdinalIgnoreCase));
+
 var hostBuilder = new HostBuilder()
     .ConfigureAppConfiguration((context, configurationBuilder) =>
     {
@@ -17,6 +19,15 @@ var hostBuilder = new HostBuilder()
         configurationBuilder.AddEnvironmentVariables();
     })
     .ConfigureFunctionsWorkerDefaults()
+    .ConfigureLogging(logging =>
+    {
+        // Under the Functions host, logs flow to the host; a one-shot run needs its own console output.
+        if (runOnce)
+        {
+            logging.AddSimpleConsole(options => options.SingleLine = true);
+            logging.AddFilter("System.Net.Http.HttpClient", LogLevel.Warning);
+        }
+    })
     .ConfigureServices((context, services) =>
     {
         services.AddOptions<SyncSettings>()
@@ -36,7 +47,7 @@ using (var startupScope = host.Services.CreateScope())
     LogResolvedPackageCacheSettings(startupScope.ServiceProvider);
 }
 
-if (args.Any(argument => string.Equals(argument, "--run-once", StringComparison.OrdinalIgnoreCase)))
+if (runOnce)
 {
     using var scope = host.Services.CreateScope();
     var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("LocalRunOnce");
@@ -48,7 +59,9 @@ if (args.Any(argument => string.Equals(argument, "--run-once", StringComparison.
         return;
     }
 
-    logger.LogInformation("Run-once completed (complete: {IsComplete}, published: {Published}). Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.IsComplete, result.Published, result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
+    logger.LogInformation(
+        "Run-once completed (published: {Published}). Package versions: {Packages} ({Top} top). Unresolved dependencies: {Unresolved}. Artifact version: {Version}. Artifact: {ArtifactPath}",
+        result.Published, result.PackageCount, result.TopPackageCount, result.UnresolvedDependencies.Count, result.ArtifactVersion, result.ArtifactPath);
     return;
 }
 
@@ -60,12 +73,10 @@ static void LogResolvedPackageCacheSettings(IServiceProvider serviceProvider)
     var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
 
     logger.LogInformation(
-        "Resolved PackageCache settings. Endpoint: {GalleryEndpoint}. PageSize: {PageSize}. FullSyncFromUtc: {FullSyncFromUtc}. InitialLookBackHours: {InitialLookBackHours}. MaxSyncDurationMinutes: {MaxSyncDurationMinutes}. MaxRetries: {MaxRetries}. StorageMode: {StorageMode}. OutputDirectory: {OutputDirectory}.",
+        "Resolved PackageCache settings. Endpoint: {GalleryEndpoint}. TopPackageCount: {TopPackageCount}. IncludeDependencies: {IncludeDependencies}. MaxRetries: {MaxRetries}. StorageMode: {StorageMode}. OutputDirectory: {OutputDirectory}.",
         settings.GalleryEndpoint,
-        settings.PageSize,
-        string.IsNullOrWhiteSpace(settings.FullSyncFromUtc) ? "<empty>" : settings.FullSyncFromUtc,
-        settings.InitialLookBackHours,
-        settings.MaxSyncDurationMinutes,
+        settings.TopPackageCount,
+        settings.IncludeDependencies,
         settings.MaxRetries,
         settings.StorageMode,
         settings.OutputDirectory);

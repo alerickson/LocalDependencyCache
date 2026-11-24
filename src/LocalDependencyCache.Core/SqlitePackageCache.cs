@@ -5,8 +5,6 @@ namespace LocalDependencyCache.Core;
 
 public sealed class SqlitePackageCache
 {
-    public const string LastPublishedStateKey = "last_published_utc";
-
     private readonly string _databasePath;
 
     public SqlitePackageCache(string databasePath)
@@ -94,22 +92,6 @@ public sealed class SqlitePackageCache
         ExecuteNonQuery(connection, "CREATE INDEX IF NOT EXISTS idx_dependencies_dep_id ON dependencies(dependency_id);");
     }
 
-    public DateTimeOffset? GetCheckpoint()
-    {
-        if (!File.Exists(_databasePath))
-        {
-            return null;
-        }
-
-        using var connection = OpenConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = "SELECT state_value FROM sync_state WHERE state_key = $stateKey LIMIT 1;";
-        command.Parameters.AddWithValue("$stateKey", LastPublishedStateKey);
-
-        var value = command.ExecuteScalar() as string;
-        return DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsed) ? parsed : null;
-    }
-
     public string? GetState(string key)
     {
         if (!File.Exists(_databasePath))
@@ -122,15 +104,6 @@ public sealed class SqlitePackageCache
         command.CommandText = "SELECT state_value FROM sync_state WHERE state_key = $stateKey LIMIT 1;";
         command.Parameters.AddWithValue("$stateKey", key);
         return command.ExecuteScalar() as string;
-    }
-
-    public void DeleteState(string key)
-    {
-        using var connection = OpenConnection();
-        using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM sync_state WHERE state_key = $key;";
-        command.Parameters.AddWithValue("$key", key);
-        command.ExecuteNonQuery();
     }
 
     public void SetState(string key, string value)

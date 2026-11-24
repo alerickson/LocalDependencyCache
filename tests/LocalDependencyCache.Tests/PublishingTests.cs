@@ -34,13 +34,12 @@ public sealed class PublishingTests : IDisposable
         var first = await RunAsync(Package("A", DateTimeOffset.Parse("2026-06-04T10:00:00Z")));
         var manifestBefore = await File.ReadAllTextAsync(ManifestPath);
 
-        // The overlap window re-reads the newest package on every run.
         var second = await RunAsync(Package("A", DateTimeOffset.Parse("2026-06-04T10:00:00Z")));
 
         Assert.True(first.Published);
         Assert.False(second.Published);
         Assert.Null(second.ArtifactVersion);
-        Assert.Equal(1, second.ProcessedPackages);
+        Assert.Equal(1, second.PackageCount);
         Assert.Equal(manifestBefore, await File.ReadAllTextAsync(ManifestPath));
         Assert.Single(Directory.GetDirectories(VersionsDirectory));
     }
@@ -160,8 +159,14 @@ public sealed class PublishingTests : IDisposable
 
     private async Task<SyncResult> RunAsync(int retainVersions, params PackageEntry[] packages)
     {
+        var gallery = new FakeGalleryClient();
+        foreach (var package in packages)
+        {
+            gallery.WithTop(package);
+        }
+
         var service = new PackageCacheSyncService(
-            new FixedGallery(packages),
+            gallery,
             new FileSystemArtifactStore(_rootPath, "latest/cache.zip", "latest/cache.manifest.json", null, retainVersions),
             Options.Create(new SyncSettings
             {
@@ -186,22 +191,6 @@ public sealed class PublishingTests : IDisposable
         if (Directory.Exists(_rootPath))
         {
             Directory.Delete(_rootPath, recursive: true);
-        }
-    }
-
-    private sealed class FixedGallery : IGalleryClient
-    {
-        private readonly IReadOnlyList<PackageEntry> _packages;
-
-        public FixedGallery(IReadOnlyList<PackageEntry> packages) => _packages = packages;
-
-        public async IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            await Task.Yield();
-            if (_packages.Count > 0)
-            {
-                yield return _packages;
-            }
         }
     }
 }

@@ -8,24 +8,18 @@ public sealed record SyncSettings
 
     public int PageSize { get; init; } = 100;
 
-    public int OverlapMinutes { get; init; } = 5;
-
     /// <summary>
-    /// How far back to look on the very first run when no checkpoint exists.
-    /// Set to a large value (e.g. 87600 = 10 years) to seed the full catalog.
-    /// Defaults to 5 hours for fast incremental top-up.
+    /// Number of most-downloaded packages to cache (latest stable version of each).
     /// </summary>
-    public int InitialLookBackHours { get; init; } = 5;
+    public int TopPackageCount { get; init; } = 100;
 
     /// <summary>
-    /// Optional hard override: start from this UTC timestamp regardless of stored checkpoint.
-    /// Use this to force a full re-sync from a known date (e.g. "2010-01-01T00:00:00Z").
-    /// When set, the stored checkpoint is ignored.
+    /// Also cache the versions that satisfy the top packages' dependencies, transitively.
     /// </summary>
-    public string? FullSyncFromUtc { get; init; }
+    public bool IncludeDependencies { get; init; } = true;
 
     /// <summary>
-    /// Retries for transient gallery failures (network errors, timeouts, 408, 429, 5xx) per page.
+    /// Retries for transient gallery failures (network errors, timeouts, 408, 429, 5xx) per request.
     /// </summary>
     public int MaxRetries { get; init; } = 4;
 
@@ -33,12 +27,6 @@ public sealed record SyncSettings
     /// Base delay for exponential backoff between retries. A Retry-After header takes precedence.
     /// </summary>
     public int RetryBaseDelayMilliseconds { get; init; } = 1000;
-
-    /// <summary>
-    /// Stop fetching after this many minutes and publish the progress so far; the next run resumes
-    /// from the saved checkpoint. Keep it below the Functions timeout. 0 means no limit.
-    /// </summary>
-    public int MaxSyncDurationMinutes { get; init; }
 
     public string StorageMode { get; init; } = "FileSystem";
 
@@ -192,23 +180,39 @@ public sealed record CacheManifest(
     string? ETag,
     DateTimeOffset LastModifiedUtc);
 
-/// <param name="IsComplete">False when the run stopped early (time budget or gallery failure) after
-/// publishing partial progress; the next run resumes from <paramref name="CheckpointUtc"/>.</param>
-/// <param name="Manifest">Null when the run found no changes and skipped publishing.</param>
+/// <param name="PackageCount">Package versions in the cache: the top packages plus resolved dependencies.</param>
+/// <param name="TopPackageCount">Top packages returned by the Gallery.</param>
+/// <param name="UnresolvedDependencies">Dependencies with no matching version in the Gallery ("Id range").</param>
+/// <param name="ContentHash">Fingerprint of the cached content; unchanged content is not republished.</param>
+/// <param name="Manifest">Null when the content matched the published cache and publishing was skipped.</param>
 public sealed record SyncResult(
-    int ProcessedPackages,
-    string CheckpointUtc,
+    int PackageCount,
+    int TopPackageCount,
+    IReadOnlyList<string> UnresolvedDependencies,
+    string ContentHash,
     string? ArtifactVersion,
     string? ArtifactPath,
-    CacheManifest? Manifest,
-    bool IsComplete = true)
+    CacheManifest? Manifest)
 {
     public bool Published => Manifest is not null;
 }
 
 public interface IGalleryClient
 {
-    IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, CancellationToken cancellationToken);
+    /// <summary>
+    /// Latest stable version of the <paramref name="count"/> most-downloaded packages, most downloaded first.
+    /// </summary>
+    Task<IReadOnlyList<PackageEntry>> GetTopPackagesAsync(int count, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Latest stable version of a package, or null if it has none (or does not exist).
+    /// </summary>
+    Task<PackageEntry?> GetLatestVersionAsync(string packageId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Every listed version of a package, including prereleases.
+    /// </summary>
+    Task<IReadOnlyList<PackageEntry>> GetAllVersionsAsync(string packageId, CancellationToken cancellationToken);
 }
 
 public interface ICacheArtifactStore

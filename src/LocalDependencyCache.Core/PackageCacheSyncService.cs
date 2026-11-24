@@ -1,13 +1,20 @@
 using System.Globalization;
-using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace LocalDependencyCache.Core;
 
+/// <summary>
+/// Rebuilds the cache from scratch each run: the latest stable version of the most-downloaded
+/// packages plus their dependencies. Publishes only when the content differs from the published cache.
+/// </summary>
 public sealed class PackageCacheSyncService
 {
+    public const string ContentHashStateKey = "content_hash";
+    public const string GeneratedUtcStateKey = "generated_utc";
+    public const string TopPackageCountStateKey = "top_package_count";
+
     private readonly IGalleryClient _galleryClient;
     private readonly ICacheArtifactStore _artifactStore;
     private readonly SyncSettings _settings;
@@ -30,10 +37,6 @@ public sealed class PackageCacheSyncService
         _logger = logger;
         _syncLock = syncLock;
     }
-
-    private const string FullSyncFromStateKey = "full_sync_from_utc";
-    private const string FullSyncCursorStateKey = "full_sync_cursor_utc";
-    private const string FullSyncCompletedStateKey = "full_sync_completed";
 
     /// <summary>
     /// Runs one sync. Returns null without changing anything when another run holds the sync lock.
@@ -59,168 +62,77 @@ public sealed class PackageCacheSyncService
     private async Task<SyncResult> RunLockedAsync(CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(_settings.OutputDirectory);
-        var workingDatabasePath = Path.Combine(_settings.OutputDirectory, _settings.DatabaseName);
-        var latestDownloaded = await _artifactStore.TryDownloadLatestAsync(workingDatabasePath, cancellationToken);
+        var previousHash = await GetPublishedContentHashAsync(cancellationToken);
 
-        if (!latestDownloaded && File.Exists(workingDatabasePath))
+        var builder = new PackageSetBuilder(_galleryClient, _logger);
+        var packageSet = await builder.BuildAsync(_settings.TopPackageCount, _settings.IncludeDependencies, cancellationToken);
+        var contentHash = PackageSetBuilder.ComputeContentHash(packageSet.Packages);
+
+        if (previousHash == contentHash)
         {
-            File.Delete(workingDatabasePath);
-        }
-
-        var cache = new SqlitePackageCache(workingDatabasePath);
-        cache.Initialize();
-
-        var overlap = TimeSpan.FromMinutes(Math.Abs(_settings.OverlapMinutes));
-        var storedCheckpoint = cache.GetCheckpoint();
-        var fullSync = GetActiveFullSync(cache, overlap);
-        DateTimeOffset fetchFrom;
-
-        if (fullSync is not null)
-        {
-            fetchFrom = fullSync.Value.FetchFrom;
-            _logger.LogInformation("Full sync from {FullSyncFrom} active. Fetching from {FetchFrom}.", fullSync.Value.RequestedFrom, fetchFrom);
-        }
-        else
-        {
-            fetchFrom = storedCheckpoint?.Subtract(overlap)
-                ?? _clock.UtcNow.AddHours(-Math.Abs(_settings.InitialLookBackHours));
-            _logger.LogInformation("Starting cache sync from {FetchFrom}.", fetchFrom);
-        }
-
-        // The checkpoint only moves forward; the overlap window and full syncs re-read older packages.
-        var latestPublished = storedCheckpoint ?? fetchFrom;
-        var fullSyncCursor = fetchFrom;
-        var processed = 0;
-        var isComplete = true;
-        Exception? failure = null;
-        var changed = 0;
-        var deadline = _settings.MaxSyncDurationMinutes > 0
-            ? _clock.UtcNow.AddMinutes(_settings.MaxSyncDurationMinutes)
-            : (DateTimeOffset?)null;
-
-        try
-        {
-            await foreach (var page in _galleryClient.GetPackagePagesAsync(fetchFrom, _settings.PageSize, cancellationToken))
-            {
-                var pageMax = page.Max(package => package.PublishedUtc) ?? fetchFrom;
-                latestPublished = Max(latestPublished, pageMax);
-                fullSyncCursor = Max(fullSyncCursor, pageMax);
-
-                var state = new Dictionary<string, string> { [SqlitePackageCache.LastPublishedStateKey] = FormatUtc(latestPublished) };
-                if (fullSync is not null)
-                {
-                    state[FullSyncCursorStateKey] = FormatUtc(fullSyncCursor);
-                }
-
-                changed += cache.UpsertPackages(page, state);
-                processed += page.Count;
-
-                if (deadline is not null && _clock.UtcNow >= deadline)
-                {
-                    isComplete = false;
-                    _logger.LogWarning(
-                        "Sync time budget of {Minutes} minutes reached after {Processed} packages. Publishing progress; the next run resumes from {Checkpoint}.",
-                        _settings.MaxSyncDurationMinutes, processed, fullSync is not null ? fullSyncCursor : latestPublished);
-                    break;
-                }
-            }
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException && processed > 0)
-        {
-            // Committed pages are consistent with their checkpoint, so publish them before failing the run.
-            isComplete = false;
-            failure = exception;
-            _logger.LogError(exception, "Gallery sync failed after {Processed} packages. Publishing progress before rethrowing.", processed);
-        }
-
-        if (isComplete)
-        {
-            if (fullSync is not null)
-            {
-                cache.SetState(FullSyncCompletedStateKey, "true");
-                cache.DeleteState(FullSyncCursorStateKey);
-            }
-
-            cache.SetState("last_success_utc", FormatUtc(_clock.UtcNow));
+            _logger.LogInformation("Cache content is unchanged ({PackageCount} package versions); skipping publish.", packageSet.Packages.Count);
+            return Result(packageSet, contentHash, null, null, null);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        // The overlap window re-reads recent packages every run; only publish when the cache content
-        // changed, there is nothing published yet, or a full sync is recording progress.
-        if (changed == 0 && latestDownloaded && fullSync is null)
+        var databasePath = Path.Combine(_settings.OutputDirectory, _settings.DatabaseName);
+        DeleteIfExists(databasePath);
+        var cache = new SqlitePackageCache(databasePath);
+        cache.Initialize();
+        var generatedUtc = _clock.UtcNow;
+        cache.UpsertPackages(packageSet.Packages, new Dictionary<string, string>
         {
-            _logger.LogInformation("No package changes in {Processed} fetched packages; skipping publish.", processed);
-            if (failure is not null)
-            {
-                ExceptionDispatchInfo.Throw(failure);
-            }
-
-            return new SyncResult(processed, FormatUtc(latestPublished), null, null, null, isComplete);
-        }
-
+            [ContentHashStateKey] = contentHash,
+            [GeneratedUtcStateKey] = generatedUtc.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
+            [TopPackageCountStateKey] = packageSet.TopPackageCount.ToString(CultureInfo.InvariantCulture)
+        });
         cache.Compact();
 
-        var compressedArtifactPath = Path.Combine(_settings.OutputDirectory, Path.GetFileNameWithoutExtension(_settings.DatabaseName) + ".zip");
-        ArtifactZipUtilities.CreateSingleFileArchive(workingDatabasePath, compressedArtifactPath);
-        var sha256 = ComputeSha256(compressedArtifactPath);
+        var artifactPath = Path.Combine(_settings.OutputDirectory, Path.GetFileNameWithoutExtension(_settings.DatabaseName) + ".zip");
+        ArtifactZipUtilities.CreateSingleFileArchive(databasePath, artifactPath);
+        var sha256 = ComputeSha256(artifactPath);
 
         // Content-addressed so a published version name is never reused for different bytes.
-        var version = $"{latestPublished.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)}-{sha256[..12]}";
-        var manifest = await _artifactStore.PublishAsync(compressedArtifactPath, version, sha256, _clock.UtcNow, cancellationToken);
+        var version = $"{generatedUtc.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)}-{sha256[..12]}";
+        cancellationToken.ThrowIfCancellationRequested();
+        var manifest = await _artifactStore.PublishAsync(artifactPath, version, sha256, generatedUtc, cancellationToken);
 
-        if (failure is not null)
-        {
-            ExceptionDispatchInfo.Throw(failure);
-        }
-
-        return new SyncResult(processed, FormatUtc(latestPublished), version, compressedArtifactPath, manifest, isComplete);
+        _logger.LogInformation("Published cache version {Version} with {PackageCount} package versions.", version, packageSet.Packages.Count);
+        return Result(packageSet, contentHash, version, artifactPath, manifest);
     }
 
-    /// <summary>
-    /// A FullSyncFromUtc value runs to completion once, resuming across runs if it is interrupted.
-    /// Changing the value starts a new full sync.
-    /// </summary>
-    private (DateTimeOffset RequestedFrom, DateTimeOffset FetchFrom)? GetActiveFullSync(SqlitePackageCache cache, TimeSpan overlap)
+    private async Task<string?> GetPublishedContentHashAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(_settings.FullSyncFromUtc)
-            || !DateTimeOffset.TryParse(_settings.FullSyncFromUtc, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var requestedFrom))
-        {
-            return null;
-        }
+        var previousPath = Path.Combine(_settings.OutputDirectory, "published-" + _settings.DatabaseName);
+        DeleteIfExists(previousPath);
 
-        var requested = FormatUtc(requestedFrom);
-        if (cache.GetState(FullSyncFromStateKey) != requested)
+        try
         {
-            cache.SetState(FullSyncFromStateKey, requested);
-            cache.DeleteState(FullSyncCursorStateKey);
-            cache.DeleteState(FullSyncCompletedStateKey);
-            return (requestedFrom, requestedFrom);
+            return await _artifactStore.TryDownloadLatestAsync(previousPath, cancellationToken)
+                ? new SqlitePackageCache(previousPath).GetState(ContentHashStateKey)
+                : null;
         }
-
-        if (cache.GetState(FullSyncCompletedStateKey) == "true")
+        finally
         {
-            _logger.LogInformation("Full sync from {FullSyncFrom} already completed; running incremental sync.", requested);
-            return null;
+            DeleteIfExists(previousPath);
         }
-
-        var cursorText = cache.GetState(FullSyncCursorStateKey);
-        var fetchFrom = DateTimeOffset.TryParse(cursorText, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var cursor)
-            ? Max(requestedFrom, cursor.Subtract(overlap))
-            : requestedFrom;
-        return (requestedFrom, fetchFrom);
     }
 
-    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right)
-        => left >= right ? left : right;
+    private static SyncResult Result(PackageSet packageSet, string contentHash, string? version, string? artifactPath, CacheManifest? manifest)
+        => new(packageSet.Packages.Count, packageSet.TopPackageCount, packageSet.UnresolvedDependencies, contentHash, version, artifactPath, manifest);
 
-    private static string FormatUtc(DateTimeOffset value)
-        => value.UtcDateTime.ToString("O", CultureInfo.InvariantCulture);
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+    }
 
     private static string ComputeSha256(string path)
     {
         using var stream = File.OpenRead(path);
-        var hash = SHA256.HashData(stream);
-        return Convert.ToHexString(hash).ToLowerInvariant();
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
     }
 }

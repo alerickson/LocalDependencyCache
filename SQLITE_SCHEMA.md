@@ -3,8 +3,9 @@
 ## Purpose
 
 The Azure Function (or local `--run-once` process) generates this SQLite cache
-from PowerShell Gallery metadata. Consumers download and extract the published
-ZIP, then search locally using `LocalDependencyCache.Query`.
+from PowerShell Gallery metadata for the most-downloaded packages and their
+dependencies. Consumers download and extract the published ZIP, then search
+locally using `LocalDependencyCache.Query`.
 
 This document describes the schema implemented by
 `src\LocalDependencyCache.Core\SqlitePackageCache.cs`, not a proposed schema.
@@ -155,32 +156,28 @@ primary key supports the reverse direction during package updates.
 The legacy `is_command_tag`, `command_name`, and command-name index are retained
 for schema compatibility; shared searches now use `tag_value` instead.
 
-## Updates, sync state, and existing caches
+## Contents, sync state, and rebuilds
 
-Each ingestion page upserts packages by name and version in one transaction,
-together with the `last_published_utc` checkpoint, so a stored checkpoint never
-gets ahead of the stored data. The checkpoint only moves forward.
-Existing tag mappings and dependencies for each refreshed version are replaced.
-The tag dictionary can retain unreferenced tags; compaction does not delete them.
+The cache contains the latest stable version of the most-downloaded packages
+(`TopPackageCount`, 100 by default) plus the versions selected to satisfy their
+dependencies, transitively. Every run builds a fresh database, so packages that
+leave the top list disappear from the next published cache. All rows are written
+in one transaction.
 
-The sync service records `last_published_utc` after every page and
-`last_success_utc` when a run finishes without stopping early. It uses the
-publication checkpoint with an overlap window for subsequent runs. A forced
-full sync also records `full_sync_from_utc`, `full_sync_cursor_utc` (progress),
-and `full_sync_completed`. Dates in package rows are Unix seconds.
+`sync_state` records:
+
+| Key | Value |
+|---|---|
+| `content_hash` | SHA-256 fingerprint of the cached packages, tags, and dependencies; a run whose fingerprint matches the published cache does not publish |
+| `generated_utc` | When the database was built (ISO 8601 UTC) |
+| `top_package_count` | How many cached versions came from the top-downloads list |
+
+Dates in package rows are Unix seconds.
 
 Initialization removes redundant `idx_package_ids_id` and
 `idx_packages_package_id_key` indexes and adds the reverse tag-mapping index.
-Existing compact-schema rows are preserved. The older schema with package
-names directly in `packages` is reset by the existing migration code.
-
-**Older caches have discarded ordinary tags.** A full metadata refresh is
-required to recover them for older package versions. Set
-`PackageCache__FullSyncFromUtc` to a date preceding the desired catalog history.
-That value runs to completion once, resuming across runs if interrupted, and
-later runs return to incremental updates. This re-fetches and
-upserts data; it does not clear an existing compact cache or remove packages
-that no longer appear in the Gallery.
+The older schema with package names directly in `packages` is reset by the
+existing migration code.
 
 ## Size tradeoffs and distribution
 
@@ -194,9 +191,11 @@ ranges remain for compatibility and downstream use. This is a compact schema,
 not a claim of minimum possible size. Retaining all tags increases storage
 relative to the earlier filtered cache, but is necessary for generic tag search.
 
-When a run adds or changes package versions, the producer runs `PRAGMA optimize`
+When the content fingerprint changes, the producer runs `PRAGMA optimize`
 and `VACUUM`, zips the database, and publishes the ZIP to an immutable,
-content-addressed versioned location and a latest alias. A separate JSON manifest,
+content-addressed versioned location and a latest alias. For 100 top packages
+and their dependencies (about 120 versions) the database is about 2.3 MB and the
+ZIP about 0.5 MB. A separate JSON manifest,
 written last, contains `artifactUrl`, `version`, `sha256`, `etag`, and
 `lastModifiedUtc`. The SHA-256 is for the ZIP, not the extracted SQLite file.
 

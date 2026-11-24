@@ -30,13 +30,13 @@ public sealed class SyncLockTests : IDisposable
     public async Task Sync_is_skipped_without_changes_when_lock_is_held()
     {
         var syncLock = new FileSystemSyncLock(Path.Combine(_rootPath, "locks", "cache.lock"));
-        var gallery = new CountingGallery();
+        var gallery = Gallery();
         await using var held = await syncLock.TryAcquireAsync(CancellationToken.None);
 
         var result = await CreateService(gallery, syncLock).RunAsync(CancellationToken.None);
 
         Assert.Null(result);
-        Assert.Equal(0, gallery.Calls);
+        Assert.Equal(0, gallery.TopRequests);
         Assert.False(File.Exists(Path.Combine(_rootPath, "latest", "cache.zip")));
     }
 
@@ -45,7 +45,7 @@ public sealed class SyncLockTests : IDisposable
     {
         var syncLock = new FileSystemSyncLock(Path.Combine(_rootPath, "locks", "cache.lock"));
 
-        var result = await CreateService(new CountingGallery(), syncLock).RunAsync(CancellationToken.None);
+        var result = await CreateService(Gallery(), syncLock).RunAsync(CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.True(File.Exists(Path.Combine(_rootPath, "latest", "cache.zip")));
@@ -57,7 +57,8 @@ public sealed class SyncLockTests : IDisposable
     public async Task Losing_the_lease_stops_the_run_without_publishing()
     {
         var syncLock = new LosableLock();
-        var gallery = new CountingGallery { AfterFirstPage = syncLock.Lose };
+        var gallery = Gallery();
+        gallery.OnTopRequested = syncLock.Lose;
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CreateService(gallery, syncLock).RunAsync(CancellationToken.None));
 
@@ -159,23 +160,10 @@ public sealed class SyncLockTests : IDisposable
         }
     }
 
-    private sealed class CountingGallery : IGalleryClient
-    {
-        public int Calls { get; private set; }
-
-        public Action? AfterFirstPage { get; init; }
-
-        public async IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            Calls++;
-            await Task.Yield();
-            yield return new[] { PackageEntry.Create("First", "1.0.0", null, null, null, null, null, DateTimeOffset.UtcNow, null, false, null, null) };
-
-            AfterFirstPage?.Invoke();
-            cancellationToken.ThrowIfCancellationRequested();
-            yield return new[] { PackageEntry.Create("Second", "1.0.0", null, null, null, null, null, DateTimeOffset.UtcNow, null, false, null, null) };
-        }
-    }
+    private static FakeGalleryClient Gallery()
+        => new FakeGalleryClient()
+            .WithTop(FakeGalleryClient.Package("First", "1.0.0", "Second:[1.0, )"))
+            .With(FakeGalleryClient.Package("Second", "1.0.0"));
 
     private sealed class LosableLock : ISyncLock, ISyncLease
     {

@@ -1,16 +1,16 @@
 # LocalDependencyCache
 
-LocalDependencyCache is a C# Azure Functions solution that builds a compact SQLite cache from PowerShell Gallery metadata and publishes that cache as a downloadable artifact.
+LocalDependencyCache is a C# Azure Functions solution that builds a compact SQLite cache of the most popular PowerShell Gallery packages and publishes that cache as a downloadable artifact.
 
 The intended flow is:
 
-1. The Azure Function reads package metadata from the PowerShell Gallery OData `Search()` endpoint.
-2. The function parses package identity, tags, and dependency version ranges.
-3. The function writes the normalized data into a local SQLite database.
-4. The function compacts the SQLite database, packages it into a ZIP artifact, and publishes that ZIP plus a JSON manifest to either:
+1. The Azure Function asks the PowerShell Gallery OData `Search()` endpoint for the most-downloaded packages (100 by default) and takes the latest stable version of each.
+2. It resolves those packages' dependencies, transitively, to the versions that satisfy their ranges.
+3. It writes package identity, tags (including `PSCommand_` and `PSDscResource_`), and dependency ranges into a fresh SQLite database.
+4. If the content changed, it compacts the database, packages it into a ZIP artifact (about 0.5 MB for 100 packages), and publishes that ZIP plus a JSON manifest to either:
    - Azure Blob Storage, or
    - a local filesystem folder for development and test.
-5. PSResourceGet downloads the published ZIP artifact from Blob Storage through Azure CDN or a static website endpoint, extracts the SQLite file locally, and performs queries locally.
+5. PSResourceGet downloads the published ZIP through Azure Front Door, extracts the SQLite file locally, and performs queries locally. Packages that are not in the cache are looked up in the Gallery as before.
 
 ## Solution layout
 
@@ -30,6 +30,10 @@ The intended flow is:
 - `tests/LocalDependencyCache.Tests`
   - Parser tests
   - End-to-end local filesystem publish tests
+- `infra`
+  - Bicep templates for the Azure resources (Function App, storage, Front Door, monitoring)
+- `azure-pipelines.yml`
+  - Azure DevOps build, test, and deploy pipeline
 
 ## Implementation overview
 
@@ -61,27 +65,28 @@ Per run, it:
 
 1. Takes the sync lock (`LockBlobName`). If another run holds it, the run is skipped without changes.
    If the lock is lost mid-run, the run stops without publishing.
-2. Creates or reuses the working output directory and downloads the current `latest` SQLite artifact when one already exists.
-3. Determines the sync start time using this priority order:
-   - `FullSyncFromUtc` if set and not yet completed — re-syncs from that date, resuming from saved progress if an earlier run stopped part-way.
-   - Stored checkpoint minus `OverlapMinutes` — normal incremental run.
-   - `now - InitialLookBackHours` — first run, no stored checkpoint.
-4. Streams packages published after that start time from PowerShell Gallery one page at a time.
-   Paging advances a `Published` cursor rather than a growing `$skip`, and transient failures
-   (network errors, timeouts, 408, 429, 5xx) are retried with exponential backoff.
-5. Commits each page to SQLite — packages, tags, dependencies, and the checkpoint — in one transaction.
-   The checkpoint only moves forward.
-6. Stops early when `MaxSyncDurationMinutes` elapses. If the Gallery fails after some pages were
-   committed, it publishes that progress and then rethrows. In both cases the next run resumes from the checkpoint.
-7. Skips publishing when no package version was added or changed (the overlap window re-reads recent
-   packages every run), unless nothing is published yet or a full sync is recording progress.
-8. Compacts the SQLite database with `PRAGMA optimize` and `VACUUM`, packages it into a ZIP artifact,
+2. Downloads the current `latest` artifact, if any, to read its content fingerprint.
+3. Selects the cache contents with [PackageSetBuilder](src/LocalDependencyCache.Core/PackageSetBuilder.cs):
+   - the latest stable version of the `TopPackageCount` most-downloaded packages
+   - when `IncludeDependencies` is on, a version for each dependency, transitively, choosing in order:
+     a version already selected that satisfies the range, the dependency's latest stable version,
+     the highest satisfying stable version, then the highest satisfying prerelease
+   - dependencies with no satisfying version are logged and reported, not cached
+
+   Gallery requests retry transient failures (network errors, timeouts, 408, 429, 5xx) with exponential backoff.
+4. Computes a SHA-256 fingerprint of the selected content. If it matches the published cache, the run
+   ends without publishing.
+5. Otherwise writes a fresh SQLite database (packages, tags, dependencies, plus `content_hash`,
+   `generated_utc`, and `top_package_count` in `sync_state`), so packages that left the top list are dropped.
+6. Compacts the database with `PRAGMA optimize` and `VACUUM`, packages it into a ZIP artifact,
    and computes a SHA-256 hash for that ZIP.
-9. Publishes, in this order:
-   - `versions/<checkpoint>-<sha256 prefix>/psgallery-cache.zip` (never overwritten)
+7. Publishes, in this order:
+   - `versions/<generated yyyyMMddHHmmss>-<sha256 prefix>/psgallery-cache.zip` (never overwritten)
    - `latest/psgallery-cache.zip`
    - `latest/psgallery-cache.manifest.json` (written last, so it always references a complete artifact)
-10. Deletes versioned artifacts beyond `RetainVersions`.
+8. Deletes versioned artifacts beyond `RetainVersions`.
+
+A failure anywhere before publishing leaves the previously published cache untouched.
 
 ### SQLite layout
 
@@ -140,9 +145,10 @@ an empty range means any version. `FindVersionsSatisfying` and
 Gallery forms such as `(, )` are treated as unbounded. Resolution is one level
 deep; callers recurse to build a full dependency graph.
 Command and DSC-resource searches match `PSCommand_` and `PSDscResource_` tags.
-All tags are now retained. Older caches need a one-time full metadata refresh
-using `PackageCache__FullSyncFromUtc` to recover previously discarded ordinary
-tags.
+
+The cache holds only the most popular packages, so a name or version lookup that finds nothing should
+fall back to the Gallery. Tag, command, and DSC-resource results cover cached packages only; a missing
+match does not mean no Gallery package provides it.
 
 ### Artifact publishing
 
@@ -156,7 +162,7 @@ Artifact publishing implementations are in [src/LocalDependencyCache.Core/Artifa
   - Uploads the versioned ZIP with `If-None-Match: *`, so a published version is never replaced
   - Uploads the latest alias, then a JSON manifest with artifact URL, version, hash, and `ETag`
 
-Version names are `<checkpoint yyyyMMddHHmmss>-<first 12 hex characters of the ZIP's SHA-256>`, so a
+Version names are `<generated yyyyMMddHHmmss>-<first 12 hex characters of the ZIP's SHA-256>`, so a
 name always identifies the same bytes. Blob uploads set CDN-friendly headers:
 
 | Blob | `Cache-Control` | `Content-Type` |
@@ -175,26 +181,17 @@ Example local configuration is in [src/LocalDependencyCache.FunctionApp/local.se
 Common settings:
 
 - `TimerSchedule`
-  - Azure Functions timer CRON expression
+  - Azure Functions timer CRON expression; hourly (`0 0 * * * *`) is cheap because each run takes seconds
 - `PackageCache__GalleryEndpoint`
   - PowerShell Gallery OData endpoint
 - `PackageCache__PageSize`
-  - Number of packages requested per page
-- `PackageCache__OverlapMinutes`
-  - Minutes to re-read before the last checkpoint on incremental runs, to avoid missing late-published packages
-- `PackageCache__InitialLookBackHours`
-  - How far back to look on the very first run when no checkpoint is stored
-  - Defaults to `5` in code; set to `87600` (10 years) in local settings to seed the full catalog
-- `PackageCache__FullSyncFromUtc`
-  - Optional: re-syncs the catalog from this UTC timestamp, ignoring the stored checkpoint
-  - Example: `2010-01-01T00:00:00Z` to re-seed the entire catalog
-  - Each value runs to completion once (resuming across runs if interrupted), then normal incremental sync resumes; change the value to run another full sync
-  - Leave empty for normal incremental behavior
-- `PackageCache__MaxSyncDurationMinutes`
-  - Stop fetching after this many minutes and publish progress; the next run continues from the checkpoint
-  - Set below the Functions timeout (for example `8` on a Consumption plan with a 10-minute timeout) so a full catalog sync spans several runs; `0` (default) means no limit
+  - Packages requested per Gallery query (maximum 100)
+- `PackageCache__TopPackageCount`
+  - Number of most-downloaded packages to cache (latest stable version of each); defaults to `100`
+- `PackageCache__IncludeDependencies`
+  - Also cache the versions that satisfy the top packages' dependencies, transitively; defaults to `true`
 - `PackageCache__MaxRetries`
-  - Retries per page for transient Gallery failures; defaults to `4`
+  - Retries per request for transient Gallery failures; defaults to `4`
 - `PackageCache__RetryBaseDelayMilliseconds`
   - Base delay for exponential backoff with jitter (capped at one minute); a `Retry-After` header takes precedence; defaults to `1000`
 - `PackageCache__StorageMode`
@@ -246,7 +243,9 @@ Current automated coverage includes:
 
 - Atom feed parsing
 - dependency parsing and NuGet version-range resolution
-- gallery paging, retries, per-page checkpoints, time budget, and full-sync resume
+- gallery queries (top packages, latest version, all versions), paging, escaping, and retries
+- package selection: top packages, transitive dependency resolution, reuse, prerelease fallback, cycles, unresolved dependencies
+- sync: rebuild each run, content fingerprint, skip unchanged, failures leave the published cache untouched
 - sync locking (file lock, lease loss, skipped runs)
 - artifact publishing: change detection, immutable content-addressed versions, cache headers, retention
 - command-tag lookup against generated SQLite
@@ -360,7 +359,7 @@ JOIN packages p ON p.package_key = d.package_key
 WHERE p.package_id = 'Sample.Module'
 ORDER BY p.version;
 
--- Sync state/checkpoints
+-- Sync state
 SELECT state_key, state_value
 FROM sync_state
 ORDER BY state_key;
@@ -378,7 +377,7 @@ If you prefer a GUI, open `.artifacts\psgallery-cache.sqlite` with DB Browser fo
 
 Suggested first checks:
 
-1. Verify `sync_state` contains `last_published_utc` and `last_success_utc`.
+1. Verify `sync_state` contains `content_hash`, `generated_utc`, and `top_package_count`.
 2. Check row counts in `packages`, `tags`, and `dependencies`.
 3. Run the command-tag lookup query above to confirm `PSCommand_*` tags were parsed correctly.
 
@@ -436,7 +435,7 @@ Expected result:
 - A ZIP artifact at `latest/psgallery-cache.zip`
 - A manifest at `latest/psgallery-cache.manifest.json`
 - A working SQLite file at `.artifacts\psgallery-cache.sqlite`
-- A versioned ZIP artifact under `versions/<checkpoint>-<hash>/`
+- A versioned ZIP artifact under `versions/<generated>-<hash>/`
 
 ### Workflow B: Step-by-step debug with Azure Functions host
 
@@ -505,9 +504,66 @@ To test Blob publishing instead of filesystem output, update local settings:
 - Set either:
   - `PackageCache__BlobConnectionString` and `PackageCache__BlobContainerName`, or
   - `PackageCache__BlobContainerUrl` for managed identity
-- Set `PackageCache__BlobBaseUrl` to the public CDN or static website base URL you expect PSResourceGet to use
+- Set `PackageCache__BlobBaseUrl` to the public base URL you expect PSResourceGet to use (in Azure, the Front Door endpoint; see [Deployment](#deployment))
 
 The manifest will then point to the published versioned SQLite file under that base URL.
+
+## Deployment
+
+Infrastructure is defined in Bicep under [infra/](infra), and [azure-pipelines.yml](azure-pipelines.yml)
+is an Azure DevOps pipeline that builds, tests, and deploys it.
+
+### Azure resources
+
+[infra/main.bicep](infra/main.bicep) (subscription scope) creates a resource group, and
+[infra/resources.bicep](infra/resources.bicep) creates everything in it:
+
+| Resource | Purpose |
+|---|---|
+| Function App on a **Flex Consumption** plan (.NET 8 isolated, system-assigned identity) | Runs `SyncCacheTimerFunction` |
+| Function storage account (private, no shared keys) | Functions host state, timer locks, and the deployment package |
+| Cache storage account, `cache` container (anonymous blob read, no listing, no shared keys) | Published artifacts and the sync lock |
+| **Azure Front Door Standard** profile, endpoint, origin, and `/cache/*` route | Dedicated CDN in front of the cache container (separate from the Gallery CDN) |
+| Log Analytics workspace and Application Insights (Entra ID auth only) | Logs and telemetry |
+| Role assignments for the Function identity | Blob Data Owner + Queue/Table Data Contributor on function storage; Blob Data Contributor on cache storage; Monitoring Metrics Publisher on Application Insights |
+
+The Function App's settings are generated by the template: Blob mode, `BlobContainerUrl` with
+managed identity, `BlobBaseUrl` set to the Front Door endpoint (or `publicBaseUrl` for a custom domain),
+`TopPackageCount`, and `/tmp/localdependencycache` as the working directory because the deployed
+package is read-only.
+
+Clients read `https://<front-door-endpoint>/cache/latest/psgallery-cache.manifest.json` (the
+`manifestUrl` deployment output) and download the versioned `artifactUrl` it contains.
+
+Template parameters are set in [infra/main.bicepparam](infra/main.bicepparam): `location`,
+`resourceGroupName`, `namePrefix`, `timerSchedule` (hourly by default), `galleryEndpoint`,
+`topPackageCount`, `retainVersions`, `instanceMemoryMB`, and `publicBaseUrl`.
+
+### Azure DevOps setup
+
+1. Create an **Azure Resource Manager service connection** (workload identity federation) named
+   `LocalDependencyCache-Azure`, or change `azureServiceConnection` in the pipeline. Its identity needs
+   **Contributor** and **Role Based Access Control Administrator** (or User Access Administrator) on the
+   subscription, because the template creates the resource group and role assignments.
+2. Create an **environment** named `localdependencycache-prod` (or change `deployEnvironment`) and add
+   approvals or checks if deployments should be gated.
+3. Create a pipeline from `azure-pipelines.yml` in this repository.
+
+### Pipeline behavior
+
+- **Build stage** (every PR and push to `main`): restores, builds, and tests in Release with Azurite
+  running so the Blob lease and publishing tests execute; publishes test results; validates and lints
+  the Bicep; publishes `functionapp` (zipped Function App) and `infra` artifacts.
+- **Deploy stage** (pushes to `main` only, skippable with the `deploy` run parameter): runs
+  `az deployment sub create`, deploys the code with `AzureFunctionApp@2` (`isFlexConsumption: true`),
+  and verifies `SyncCacheTimerFunction` is registered.
+
+### First deployment
+
+The first timer run publishes a complete cache; there is no seeding phase. Later runs publish only
+when the top packages, their versions, or their dependencies change.
+
+Front Door Standard has a monthly base fee in addition to data transfer; see Azure pricing.
 
 ## Useful files
 
