@@ -121,7 +121,8 @@ public sealed record DependencyEntry(
                 continue;
             }
 
-            var parts = cleaned.Split(':', 2, StringSplitOptions.TrimEntries);
+            // Gallery format is "Id:Range:TargetFramework"; the framework segment is usually empty.
+            var parts = cleaned.Split(':', 3, StringSplitOptions.TrimEntries);
             if (string.IsNullOrWhiteSpace(parts[0]))
             {
                 continue;

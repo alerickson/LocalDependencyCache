@@ -22,8 +22,14 @@ The shared query client supports all five search modes:
 Names and tags use SQLite `NOCASE` (ASCII case-insensitive comparison). Versions
 use case-sensitive text equality; version ranges and equivalent version spellings
 are not resolved by these search methods. Results contain package name and
-version, ordered by name and version text, not semantic version precedence.
-All cached versions, including prereleases, are eligible.
+version, ordered by name and then NuGet semantic-version precedence (applied in
+the client after the SQL query). All cached versions, including prereleases,
+are eligible.
+
+Dependency resolution is provided by `GetDependencies(name, version)`,
+`FindVersionsSatisfying(name, range, includePrerelease)`, and
+`FindLatestVersionSatisfying(name, range, includePrerelease)`. See
+[Dependency resolution](#dependency-resolution).
 
 The existing `SearchByPackageIdPrefix(prefix, maxResults = 100)` remains available.
 It treats `%`, `_`, and backslash in the prefix literally, not as SQL patterns.
@@ -188,6 +194,18 @@ the ZIP to a versioned location and a latest alias. A separate JSON manifest
 contains `artifactUrl`, `version`, `sha256`, `etag`, and `lastModifiedUtc`.
 The SHA-256 is for the ZIP, not the extracted SQLite file.
 
-Dependency data is stored for future resolution. The shared query client does
-not yet expose dependency resolution; final range checks must use NuGet
-semantic-version rules rather than lexical SQL comparisons.
+## Dependency resolution
+
+Gallery dependency strings have the form `Id:Range:TargetFramework`, joined by
+`|`, for example `Az.Accounts:[5.5.5, ):|Az.Aks:[7.2.1, 7.2.1]:`. The writer
+stores each dependency's `Range` segment in `version_range_raw`; the target
+framework segment is ignored.
+
+`GetDependencies` reads `dependencies` for one exact package version.
+`FindVersionsSatisfying` loads the candidate versions for the dependency name,
+then filters them in .NET with `NuGet.Versioning` `VersionRange.Satisfies`.
+The stored `min_version`/`max_version` columns are not used for matching,
+because SQL text comparison does not follow semantic-version precedence.
+Empty, `*`, and `(, )` ranges are unbounded. Prerelease versions are excluded
+unless requested, and stored versions that are not valid NuGet versions never
+satisfy a range.

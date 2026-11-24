@@ -90,7 +90,7 @@ Supported lookup patterns include:
 
 - package identity search by `Id` and `Version`
 - command search via tags prefixed with `PSCommand_`
-- dependency version-range storage for later resolution
+- dependency lookup and NuGet version-range resolution
 
 ### Shared query library
 
@@ -108,11 +108,28 @@ var tagMatches = client.FindByTag("Azure");
 var dscMatches = client.FindByDscResourceName("File");
 var commandMatches = client.FindByCommandName("Get-Module");
 var idPrefixMatches = client.SearchByPackageIdPrefix("Az.", maxResults: 50);
+
+// Dependency resolution
+var dependencies = client.GetDependencies("Az.Compute", "1.0.0");
+foreach (var dependency in dependencies)
+{
+    var best = client.FindLatestVersionSatisfying(dependency.Id, dependency.VersionRange);
+}
+var candidates = client.FindVersionsSatisfying("Az.Accounts", "[5.5.5, )", includePrerelease: true);
 ```
 
 Exact names and tags are ASCII case-insensitive; versions match the stored
 string exactly. Searches return all matching cached versions, including
-prereleases, sorted by name and version text (not semantic version).
+prereleases, sorted by name and then by semantic version (so `1.9.0` precedes
+`1.10.0-beta`, which precedes `1.10.0`). `SearchByPackageIdPrefix` applies its
+limit before that sort, in name and version-text order.
+
+`GetDependencies` returns the raw NuGet range declared for each dependency;
+an empty range means any version. `FindVersionsSatisfying` and
+`FindLatestVersionSatisfying` apply NuGet range semantics (via
+`NuGet.Versioning`) and exclude prereleases unless `includePrerelease` is set.
+Gallery forms such as `(, )` are treated as unbounded. Resolution is one level
+deep; callers recurse to build a full dependency graph.
 Command and DSC-resource searches match `PSCommand_` and `PSDscResource_` tags.
 All tags are now retained. Older caches need a one-time full metadata refresh
 using `PackageCache__FullSyncFromUtc` to recover previously discarded ordinary

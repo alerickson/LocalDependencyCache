@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using NuGet.Versioning;
 
 namespace LocalDependencyCache.Query;
 
@@ -93,6 +94,62 @@ public sealed class SqlitePackageQueryClient
         return ReadIdentities(command);
     }
 
+    /// <summary>
+    /// Returns the dependencies declared by an exact cached package version.
+    /// Returns an empty list when the version has no dependencies or is not cached.
+    /// </summary>
+    public IReadOnlyList<PackageDependency> GetDependencies(string packageId, string version)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(packageId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(version);
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT d.dependency_id, d.version_range_raw
+            FROM package_ids pi
+            JOIN packages p ON p.package_id_key = pi.package_id_key
+            JOIN dependencies d ON d.package_key = p.package_key
+            WHERE pi.package_id = $packageId AND p.version = $version
+            ORDER BY d.dependency_id;
+            """;
+        command.Parameters.AddWithValue("$packageId", packageId);
+        command.Parameters.AddWithValue("$version", version);
+
+        using var reader = command.ExecuteReader();
+        var result = new List<PackageDependency>();
+        while (reader.Read())
+        {
+            result.Add(new PackageDependency(reader.GetString(0), reader.IsDBNull(1) ? string.Empty : reader.GetString(1)));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns cached versions of <paramref name="packageId"/> that satisfy a NuGet version range,
+    /// ordered from lowest to highest. An empty or null range matches any version.
+    /// </summary>
+    public IReadOnlyList<PackageIdentity> FindVersionsSatisfying(string packageId, string? versionRange, bool includePrerelease = false)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(packageId);
+        if (!VersionRangeParser.TryParse(versionRange, out var range))
+        {
+            throw new ArgumentException($"'{versionRange}' is not a valid NuGet version range.", nameof(versionRange));
+        }
+
+        return FindByPackageId(packageId)
+            .Where(candidate => NuGetVersion.TryParse(candidate.Version, out var version)
+                && (includePrerelease || !version.IsPrerelease)
+                && range.Satisfies(version))
+            .ToList();
+    }
+
+    /// <summary>
+    /// Returns the highest cached version that satisfies the range, or null when none does.
+    /// </summary>
+    public PackageIdentity? FindLatestVersionSatisfying(string packageId, string? versionRange, bool includePrerelease = false)
+        => FindVersionsSatisfying(packageId, versionRange, includePrerelease).LastOrDefault();
+
     private static IReadOnlyList<PackageIdentity> ReadIdentities(SqliteCommand command)
     {
         using var reader = command.ExecuteReader();
@@ -102,7 +159,10 @@ public sealed class SqlitePackageQueryClient
             result.Add(new PackageIdentity(reader.GetString(0), reader.GetString(1)));
         }
 
-        return result;
+        return result
+            .OrderBy(identity => identity.Id, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(identity => identity.Version, VersionStringComparer.Instance)
+            .ToList();
     }
 
     private SqliteConnection OpenConnection()
