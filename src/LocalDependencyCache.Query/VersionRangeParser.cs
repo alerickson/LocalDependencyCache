@@ -22,5 +22,5 @@ public static class VersionRangeParser
     }
 
     private static bool IsUnbounded(string range)
-        => range.Replace(" ", string.Empty, StringComparison.Ordinal) is "(,)" or "[,]" or "[,)" or "(,]";
+        => range.Replace(" ", string.Empty) is "(,)" or "[,]" or "[,)" or "(,]";
 }

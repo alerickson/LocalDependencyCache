@@ -17,7 +17,7 @@ public sealed class VersionStringComparer : IComparer<string>
 
         if (xParsed && yParsed)
         {
-            var result = VersionComparer.Default.Compare(xVersion, yVersion);
+            var result = VersionComparer.Default.Compare(xVersion!, yVersion!);
             return result != 0 ? result : string.CompareOrdinal(x, y);
         }
 

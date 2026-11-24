@@ -14,19 +14,19 @@ public sealed class SqlitePackageQueryClient
 
     public IReadOnlyList<PackageIdentity> FindByCommandName(string commandName)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(commandName);
+        Guard.NotNullOrWhiteSpace(commandName);
         return FindByTag("PSCommand_" + commandName);
     }
 
     public IReadOnlyList<PackageIdentity> FindByDscResourceName(string resourceName)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(resourceName);
+        Guard.NotNullOrWhiteSpace(resourceName);
         return FindByTag("PSDscResource_" + resourceName);
     }
 
     public IReadOnlyList<PackageIdentity> FindByTag(string tag)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(tag);
+        Guard.NotNullOrWhiteSpace(tag);
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -48,13 +48,13 @@ public sealed class SqlitePackageQueryClient
 
     public IReadOnlyList<PackageIdentity> FindByPackageIdAndVersion(string packageId, string version)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(version);
+        Guard.NotNullOrWhiteSpace(version);
         return FindByPackageIdCore(packageId, version);
     }
 
     private IReadOnlyList<PackageIdentity> FindByPackageIdCore(string packageId, string? version)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(packageId);
+        Guard.NotNullOrWhiteSpace(packageId);
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -76,8 +76,8 @@ public sealed class SqlitePackageQueryClient
 
     public IReadOnlyList<PackageIdentity> SearchByPackageIdPrefix(string packageIdPrefix, int maxResults = 100)
     {
-        ArgumentNullException.ThrowIfNull(packageIdPrefix);
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxResults);
+        Guard.NotNull(packageIdPrefix);
+        Guard.Positive(maxResults);
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -100,8 +100,8 @@ public sealed class SqlitePackageQueryClient
     /// </summary>
     public IReadOnlyList<PackageDependency> GetDependencies(string packageId, string version)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(packageId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(version);
+        Guard.NotNullOrWhiteSpace(packageId);
+        Guard.NotNullOrWhiteSpace(version);
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -131,7 +131,7 @@ public sealed class SqlitePackageQueryClient
     /// </summary>
     public IReadOnlyList<PackageIdentity> FindVersionsSatisfying(string packageId, string? versionRange, bool includePrerelease = false)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(packageId);
+        Guard.NotNullOrWhiteSpace(packageId);
         if (!VersionRangeParser.TryParse(versionRange, out var range))
         {
             throw new ArgumentException($"'{versionRange}' is not a valid NuGet version range.", nameof(versionRange));

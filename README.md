@@ -21,6 +21,7 @@ The intended flow is:
   - Artifact publishing abstractions and implementations
 - `src/LocalDependencyCache.Query`
   - Shared query library for cache consumers (including PSResourceGet scenarios)
+  - Targets `netstandard2.0`, so .NET Framework 4.7.2+ (PSResourceGet) and .NET 8 can both reference it; consumers can use any C# version
   - Read-only SQLite query APIs for name, name + version, tag, DSC resource, command, and package-prefix search
 - `src/LocalDependencyCache.FunctionApp`
   - Azure Functions isolated worker host
