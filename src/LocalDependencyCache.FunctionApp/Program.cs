@@ -48,7 +48,7 @@ if (args.Any(argument => string.Equals(argument, "--run-once", StringComparison.
         return;
     }
 
-    logger.LogInformation("Run-once completed (complete: {IsComplete}). Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.IsComplete, result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
+    logger.LogInformation("Run-once completed (complete: {IsComplete}, published: {Published}). Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.IsComplete, result.Published, result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
     return;
 }
 
@@ -78,10 +78,11 @@ static ICacheArtifactStore CreateArtifactStore(IServiceProvider serviceProvider)
     if (IsBlobMode(settings))
     {
         var baseUrl = settings.BlobBaseUrl ?? settings.BlobContainerUrl ?? throw new InvalidOperationException("Blob storage mode requires PackageCache__BlobBaseUrl or PackageCache__BlobContainerUrl.");
-        return new BlobArtifactStore(CreateContainerClient(settings), settings.LatestBlobName, settings.ManifestBlobName, baseUrl);
+        var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<BlobArtifactStore>();
+        return new BlobArtifactStore(CreateContainerClient(settings), settings.LatestBlobName, settings.ManifestBlobName, baseUrl, settings.RetainVersions, logger);
     }
 
-    return new FileSystemArtifactStore(settings.OutputDirectory, settings.LatestBlobName, settings.ManifestBlobName, settings.BlobBaseUrl);
+    return new FileSystemArtifactStore(settings.OutputDirectory, settings.LatestBlobName, settings.ManifestBlobName, settings.BlobBaseUrl, settings.RetainVersions);
 }
 
 static ISyncLock CreateSyncLock(IServiceProvider serviceProvider)

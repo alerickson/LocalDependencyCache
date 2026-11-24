@@ -28,6 +28,10 @@ public sealed class SyncCacheTimerFunction
         {
             _logger.LogWarning("Sync skipped: another run holds the sync lock.");
         }
+        else if (!result.Published)
+        {
+            _logger.LogInformation("Sync found no package changes; nothing published. Fetched: {Packages}. Checkpoint: {Checkpoint}.", result.ProcessedPackages, result.CheckpointUtc);
+        }
         else if (result.IsComplete)
         {
             _logger.LogInformation("Sync completed. Packages: {Packages}. Artifact version: {Version}.", result.ProcessedPackages, result.ArtifactVersion);

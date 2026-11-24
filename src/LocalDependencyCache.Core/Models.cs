@@ -55,6 +55,12 @@ public sealed record SyncSettings
     /// </summary>
     public string LockBlobName { get; init; } = "locks/psgallery-cache.lock";
 
+    /// <summary>
+    /// Number of versioned artifacts to keep under versions/; older ones are deleted after a publish.
+    /// 0 keeps every version.
+    /// </summary>
+    public int RetainVersions { get; init; } = 10;
+
     public string? BlobConnectionString { get; init; }
 
     public string? BlobContainerName { get; init; }
@@ -188,13 +194,17 @@ public sealed record CacheManifest(
 
 /// <param name="IsComplete">False when the run stopped early (time budget or gallery failure) after
 /// publishing partial progress; the next run resumes from <paramref name="CheckpointUtc"/>.</param>
+/// <param name="Manifest">Null when the run found no changes and skipped publishing.</param>
 public sealed record SyncResult(
     int ProcessedPackages,
     string CheckpointUtc,
-    string ArtifactVersion,
-    string ArtifactPath,
-    CacheManifest Manifest,
-    bool IsComplete = true);
+    string? ArtifactVersion,
+    string? ArtifactPath,
+    CacheManifest? Manifest,
+    bool IsComplete = true)
+{
+    public bool Published => Manifest is not null;
+}
 
 public interface IGalleryClient
 {

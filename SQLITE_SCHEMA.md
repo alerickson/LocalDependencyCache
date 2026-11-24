@@ -194,10 +194,11 @@ ranges remain for compatibility and downstream use. This is a compact schema,
 not a claim of minimum possible size. Retaining all tags increases storage
 relative to the earlier filtered cache, but is necessary for generic tag search.
 
-The producer runs `PRAGMA optimize` and `VACUUM`, zips the database, and publishes
-the ZIP to a versioned location and a latest alias. A separate JSON manifest
-contains `artifactUrl`, `version`, `sha256`, `etag`, and `lastModifiedUtc`.
-The SHA-256 is for the ZIP, not the extracted SQLite file.
+When a run adds or changes package versions, the producer runs `PRAGMA optimize`
+and `VACUUM`, zips the database, and publishes the ZIP to an immutable,
+content-addressed versioned location and a latest alias. A separate JSON manifest,
+written last, contains `artifactUrl`, `version`, `sha256`, `etag`, and
+`lastModifiedUtc`. The SHA-256 is for the ZIP, not the extracted SQLite file.
 
 ## Dependency resolution
 

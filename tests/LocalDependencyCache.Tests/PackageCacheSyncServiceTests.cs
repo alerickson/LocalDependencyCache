@@ -51,6 +51,8 @@ public sealed class PackageCacheSyncServiceTests
             var result = await service.RunAsync(CancellationToken.None);
 
             Assert.NotNull(result);
+            Assert.NotNull(result.Manifest);
+            Assert.NotNull(result.ArtifactVersion);
 
             Assert.Equal(1, result.ProcessedPackages);
             Assert.NotEmpty(result.Manifest.ArtifactUrl);

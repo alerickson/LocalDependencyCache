@@ -72,12 +72,15 @@ Per run, it:
    The checkpoint only moves forward.
 6. Stops early when `MaxSyncDurationMinutes` elapses. If the Gallery fails after some pages were
    committed, it publishes that progress and then rethrows. In both cases the next run resumes from the checkpoint.
-7. Compacts the SQLite database with `PRAGMA optimize` and `VACUUM`.
-8. Packages the SQLite file into a ZIP artifact and computes a SHA-256 hash for that ZIP.
-9. Publishes:
-  - `latest/psgallery-cache.zip`
-   - `latest/psgallery-cache.manifest.json`
-  - `versions/<timestamp>/psgallery-cache.zip`
+7. Skips publishing when no package version was added or changed (the overlap window re-reads recent
+   packages every run), unless nothing is published yet or a full sync is recording progress.
+8. Compacts the SQLite database with `PRAGMA optimize` and `VACUUM`, packages it into a ZIP artifact,
+   and computes a SHA-256 hash for that ZIP.
+9. Publishes, in this order:
+   - `versions/<checkpoint>-<sha256 prefix>/psgallery-cache.zip` (never overwritten)
+   - `latest/psgallery-cache.zip`
+   - `latest/psgallery-cache.manifest.json` (written last, so it always references a complete artifact)
+10. Deletes versioned artifacts beyond `RetainVersions`.
 
 ### SQLite layout
 
@@ -149,8 +152,20 @@ Artifact publishing implementations are in [src/LocalDependencyCache.Core/Artifa
   - Writes versioned and latest ZIP artifacts under a local folder
 - `BlobArtifactStore`
   - Used for Azure deployment
-  - Uploads both the versioned ZIP and latest alias to Blob Storage
-  - Writes a JSON manifest with artifact URL, version, hash, and `ETag`
+  - Uploads the versioned ZIP with `If-None-Match: *`, so a published version is never replaced
+  - Uploads the latest alias, then a JSON manifest with artifact URL, version, hash, and `ETag`
+
+Version names are `<checkpoint yyyyMMddHHmmss>-<first 12 hex characters of the ZIP's SHA-256>`, so a
+name always identifies the same bytes. Blob uploads set CDN-friendly headers:
+
+| Blob | `Cache-Control` | `Content-Type` |
+|---|---|---|
+| `versions/...` | `public, max-age=31536000, immutable` | `application/zip` |
+| `latest/...zip` | `public, max-age=300` | `application/zip` |
+| `latest/...manifest.json` | `public, max-age=300` | `application/json` |
+
+Clients should read the manifest and download `artifactUrl` (a versioned, cache-forever URL), then verify
+`sha256`. The `latest` ZIP alias is up to 5 minutes stale behind a CDN.
 
 ## Configuration
 
@@ -191,6 +206,8 @@ Common settings:
   - Published latest ZIP path
 - `PackageCache__ManifestBlobName`
   - Published latest manifest path
+- `PackageCache__RetainVersions`
+  - Number of versioned artifacts to keep (newest by creation time; the current one is always kept); defaults to `10`, `0` keeps all
 - `PackageCache__LockBlobName`
   - Lock used to stop overlapping sync runs; defaults to `locks/psgallery-cache.lock`
   - In Blob mode this blob is leased for the run (60-second lease, renewed every 15 seconds, released at the end; a crashed run's lease expires on its own)
@@ -230,7 +247,7 @@ Current automated coverage includes:
 - dependency parsing and NuGet version-range resolution
 - gallery paging, retries, per-page checkpoints, time budget, and full-sync resume
 - sync locking (file lock, lease loss, skipped runs)
-- filesystem artifact publishing
+- artifact publishing: change detection, immutable content-addressed versions, cache headers, retention
 - command-tag lookup against generated SQLite
 
 The Blob lease tests are skipped unless `LDC_TEST_BLOB_CONNECTION_STRING` is set.
@@ -418,7 +435,7 @@ Expected result:
 - A ZIP artifact at `latest/psgallery-cache.zip`
 - A manifest at `latest/psgallery-cache.manifest.json`
 - A working SQLite file at `.artifacts\psgallery-cache.sqlite`
-- A versioned ZIP artifact under `versions/<timestamp>/`
+- A versioned ZIP artifact under `versions/<checkpoint>-<hash>/`
 
 ### Workflow B: Step-by-step debug with Azure Functions host
 

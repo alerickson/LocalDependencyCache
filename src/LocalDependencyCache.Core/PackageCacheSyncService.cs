@@ -93,6 +93,7 @@ public sealed class PackageCacheSyncService
         var processed = 0;
         var isComplete = true;
         Exception? failure = null;
+        var changed = 0;
         var deadline = _settings.MaxSyncDurationMinutes > 0
             ? _clock.UtcNow.AddMinutes(_settings.MaxSyncDurationMinutes)
             : (DateTimeOffset?)null;
@@ -111,7 +112,7 @@ public sealed class PackageCacheSyncService
                     state[FullSyncCursorStateKey] = FormatUtc(fullSyncCursor);
                 }
 
-                cache.UpsertPackages(page, state);
+                changed += cache.UpsertPackages(page, state);
                 processed += page.Count;
 
                 if (deadline is not null && _clock.UtcNow >= deadline)
@@ -144,12 +145,28 @@ public sealed class PackageCacheSyncService
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        // The overlap window re-reads recent packages every run; only publish when the cache content
+        // changed, there is nothing published yet, or a full sync is recording progress.
+        if (changed == 0 && latestDownloaded && fullSync is null)
+        {
+            _logger.LogInformation("No package changes in {Processed} fetched packages; skipping publish.", processed);
+            if (failure is not null)
+            {
+                ExceptionDispatchInfo.Throw(failure);
+            }
+
+            return new SyncResult(processed, FormatUtc(latestPublished), null, null, null, isComplete);
+        }
+
         cache.Compact();
 
-        var version = latestPublished.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
         var compressedArtifactPath = Path.Combine(_settings.OutputDirectory, Path.GetFileNameWithoutExtension(_settings.DatabaseName) + ".zip");
         ArtifactZipUtilities.CreateSingleFileArchive(workingDatabasePath, compressedArtifactPath);
         var sha256 = ComputeSha256(compressedArtifactPath);
+
+        // Content-addressed so a published version name is never reused for different bytes.
+        var version = $"{latestPublished.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture)}-{sha256[..12]}";
         var manifest = await _artifactStore.PublishAsync(compressedArtifactPath, version, sha256, _clock.UtcNow, cancellationToken);
 
         if (failure is not null)

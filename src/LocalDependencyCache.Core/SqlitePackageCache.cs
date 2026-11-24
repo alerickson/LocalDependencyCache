@@ -156,15 +156,21 @@ public sealed class SqlitePackageCache
     /// <summary>
     /// Upserts a batch of packages. <paramref name="state"/> entries (such as the sync checkpoint) are
     /// written in the same transaction so the checkpoint never gets ahead of the stored data.
+    /// Returns how many package versions were new or had changed metadata.
     /// </summary>
-    public void UpsertPackages(IReadOnlyList<PackageEntry> packages, IReadOnlyDictionary<string, string>? state = null)
+    public int UpsertPackages(IReadOnlyList<PackageEntry> packages, IReadOnlyDictionary<string, string>? state = null)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
+        var changed = 0;
 
         foreach (var package in packages)
         {
-            var packageKey = UpsertPackage(connection, transaction, package);
+            if (UpsertPackage(connection, transaction, package, out var packageKey))
+            {
+                changed++;
+            }
+
             DeletePackageChildren(connection, transaction, packageKey);
             UpsertTags(connection, transaction, packageKey, package.Tags);
             InsertDependencies(connection, transaction, packageKey, package.Dependencies);
@@ -176,6 +182,7 @@ public sealed class SqlitePackageCache
         }
 
         transaction.Commit();
+        return changed;
     }
 
     public void Compact()
@@ -209,13 +216,15 @@ public sealed class SqlitePackageCache
         command.ExecuteNonQuery();
     }
 
-    private static long UpsertPackage(SqliteConnection connection, SqliteTransaction transaction, PackageEntry package)
+    private static bool UpsertPackage(SqliteConnection connection, SqliteTransaction transaction, PackageEntry package, out long packageKey)
     {
         var packageIdKey = GetOrCreatePackageIdKey(connection, transaction, package.Id);
+        bool changed;
 
         using (var command = connection.CreateCommand())
         {
             command.Transaction = transaction;
+            // The WHERE clause makes an identical re-read report zero changed rows.
             command.CommandText = """
                 INSERT INTO packages (
                     package_id_key, version, normalized_version,
@@ -228,7 +237,11 @@ public sealed class SqlitePackageCache
                     normalized_version = excluded.normalized_version,
                     published_unix = excluded.published_unix,
                     updated_unix = excluded.updated_unix,
-                    is_prerelease = excluded.is_prerelease;
+                    is_prerelease = excluded.is_prerelease
+                WHERE normalized_version IS NOT excluded.normalized_version
+                    OR published_unix IS NOT excluded.published_unix
+                    OR updated_unix IS NOT excluded.updated_unix
+                    OR is_prerelease IS NOT excluded.is_prerelease;
                 """;
             command.Parameters.AddWithValue("$packageIdKey", packageIdKey);
             command.Parameters.AddWithValue("$version", package.Version);
@@ -236,7 +249,7 @@ public sealed class SqlitePackageCache
             command.Parameters.AddWithValue("$publishedUnix", package.PublishedUtc?.ToUnixTimeSeconds() is long publishedUnix ? publishedUnix : DBNull.Value);
             command.Parameters.AddWithValue("$updatedUnix", package.UpdatedUtc?.ToUnixTimeSeconds() is long updatedUnix ? updatedUnix : DBNull.Value);
             command.Parameters.AddWithValue("$isPrerelease", package.IsPrerelease ? 1 : 0);
-            command.ExecuteNonQuery();
+            changed = command.ExecuteNonQuery() > 0;
         }
 
         using var lookup = connection.CreateCommand();
@@ -244,7 +257,8 @@ public sealed class SqlitePackageCache
         lookup.CommandText = "SELECT package_key FROM packages WHERE package_id_key = $packageIdKey AND version = $version LIMIT 1;";
         lookup.Parameters.AddWithValue("$packageIdKey", packageIdKey);
         lookup.Parameters.AddWithValue("$version", package.Version);
-        return (long)(lookup.ExecuteScalar() ?? throw new InvalidOperationException("Unable to locate package key."));
+        packageKey = (long)(lookup.ExecuteScalar() ?? throw new InvalidOperationException("Unable to locate package key."));
+        return changed;
     }
 
     private static long GetOrCreatePackageIdKey(SqliteConnection connection, SqliteTransaction transaction, string packageId)
