@@ -24,6 +24,13 @@ public sealed class SyncCacheTimerFunction
         }
 
         var result = await _syncService.RunAsync(cancellationToken);
-        _logger.LogInformation("Sync completed. Packages: {Packages}. Artifact version: {Version}.", result.ProcessedPackages, result.ArtifactVersion);
+        if (result.IsComplete)
+        {
+            _logger.LogInformation("Sync completed. Packages: {Packages}. Artifact version: {Version}.", result.ProcessedPackages, result.ArtifactVersion);
+        }
+        else
+        {
+            _logger.LogWarning("Sync stopped at its time budget and published partial progress. Packages: {Packages}. Checkpoint: {Checkpoint}. The next run continues.", result.ProcessedPackages, result.CheckpointUtc);
+        }
     }
 }

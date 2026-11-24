@@ -5,6 +5,8 @@ namespace LocalDependencyCache.Core;
 
 public sealed class SqlitePackageCache
 {
+    public const string LastPublishedStateKey = "last_published_utc";
+
     private readonly string _databasePath;
 
     public SqlitePackageCache(string databasePath)
@@ -102,16 +104,45 @@ public sealed class SqlitePackageCache
         using var connection = OpenConnection();
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT state_value FROM sync_state WHERE state_key = $stateKey LIMIT 1;";
-        command.Parameters.AddWithValue("$stateKey", "last_published_utc");
+        command.Parameters.AddWithValue("$stateKey", LastPublishedStateKey);
 
         var value = command.ExecuteScalar() as string;
-        return DateTimeOffset.TryParse(value, out var parsed) ? parsed : null;
+        return DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsed) ? parsed : null;
+    }
+
+    public string? GetState(string key)
+    {
+        if (!File.Exists(_databasePath))
+        {
+            return null;
+        }
+
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT state_value FROM sync_state WHERE state_key = $stateKey LIMIT 1;";
+        command.Parameters.AddWithValue("$stateKey", key);
+        return command.ExecuteScalar() as string;
+    }
+
+    public void DeleteState(string key)
+    {
+        using var connection = OpenConnection();
+        using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM sync_state WHERE state_key = $key;";
+        command.Parameters.AddWithValue("$key", key);
+        command.ExecuteNonQuery();
     }
 
     public void SetState(string key, string value)
     {
         using var connection = OpenConnection();
+        SetState(connection, null, key, value);
+    }
+
+    private static void SetState(SqliteConnection connection, SqliteTransaction? transaction, string key, string value)
+    {
         using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO sync_state (state_key, state_value)
             VALUES ($key, $value)
@@ -122,7 +153,11 @@ public sealed class SqlitePackageCache
         command.ExecuteNonQuery();
     }
 
-    public void UpsertPackages(IReadOnlyList<PackageEntry> packages)
+    /// <summary>
+    /// Upserts a batch of packages. <paramref name="state"/> entries (such as the sync checkpoint) are
+    /// written in the same transaction so the checkpoint never gets ahead of the stored data.
+    /// </summary>
+    public void UpsertPackages(IReadOnlyList<PackageEntry> packages, IReadOnlyDictionary<string, string>? state = null)
     {
         using var connection = OpenConnection();
         using var transaction = connection.BeginTransaction();
@@ -133,6 +168,11 @@ public sealed class SqlitePackageCache
             DeletePackageChildren(connection, transaction, packageKey);
             UpsertTags(connection, transaction, packageKey, package.Tags);
             InsertDependencies(connection, transaction, packageKey, package.Dependencies);
+        }
+
+        foreach (var (key, value) in state ?? new Dictionary<string, string>())
+        {
+            SetState(connection, transaction, key, value);
         }
 
         transaction.Commit();

@@ -41,7 +41,7 @@ if (args.Any(argument => string.Equals(argument, "--run-once", StringComparison.
     var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("LocalRunOnce");
     var service = scope.ServiceProvider.GetRequiredService<PackageCacheSyncService>();
     var result = await service.RunAsync(CancellationToken.None);
-    logger.LogInformation("Run-once completed. Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
+    logger.LogInformation("Run-once completed (complete: {IsComplete}). Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.IsComplete, result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
     return;
 }
 
@@ -53,11 +53,13 @@ static void LogResolvedPackageCacheSettings(IServiceProvider serviceProvider)
     var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
 
     logger.LogInformation(
-        "Resolved PackageCache settings. Endpoint: {GalleryEndpoint}. PageSize: {PageSize}. FullSyncFromUtc: {FullSyncFromUtc}. InitialLookBackHours: {InitialLookBackHours}. StorageMode: {StorageMode}. OutputDirectory: {OutputDirectory}.",
+        "Resolved PackageCache settings. Endpoint: {GalleryEndpoint}. PageSize: {PageSize}. FullSyncFromUtc: {FullSyncFromUtc}. InitialLookBackHours: {InitialLookBackHours}. MaxSyncDurationMinutes: {MaxSyncDurationMinutes}. MaxRetries: {MaxRetries}. StorageMode: {StorageMode}. OutputDirectory: {OutputDirectory}.",
         settings.GalleryEndpoint,
         settings.PageSize,
         string.IsNullOrWhiteSpace(settings.FullSyncFromUtc) ? "<empty>" : settings.FullSyncFromUtc,
         settings.InitialLookBackHours,
+        settings.MaxSyncDurationMinutes,
+        settings.MaxRetries,
         settings.StorageMode,
         settings.OutputDirectory);
 }

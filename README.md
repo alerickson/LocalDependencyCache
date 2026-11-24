@@ -61,12 +61,16 @@ Per run, it:
 1. Creates or reuses the working output directory.
 2. Downloads the current `latest` SQLite artifact when one already exists.
 3. Determines the sync start time using this priority order:
-   - `FullSyncFromUtc` if set — ignores any stored checkpoint and re-syncs from that date.
+   - `FullSyncFromUtc` if set and not yet completed — re-syncs from that date, resuming from saved progress if an earlier run stopped part-way.
    - Stored checkpoint minus `OverlapMinutes` — normal incremental run.
    - `now - InitialLookBackHours` — first run, no stored checkpoint.
-4. Fetches all packages published after that start time from PowerShell Gallery.
-5. Upserts packages, tags, and dependencies into SQLite.
-6. Updates checkpoint and success metadata.
+4. Streams packages published after that start time from PowerShell Gallery one page at a time.
+   Paging advances a `Published` cursor rather than a growing `$skip`, and transient failures
+   (network errors, timeouts, 408, 429, 5xx) are retried with exponential backoff.
+5. Commits each page to SQLite — packages, tags, dependencies, and the checkpoint — in one transaction.
+   The checkpoint only moves forward.
+6. Stops early when `MaxSyncDurationMinutes` elapses. If the Gallery fails after some pages were
+   committed, it publishes that progress and then rethrows. In both cases the next run resumes from the checkpoint.
 7. Compacts the SQLite database with `PRAGMA optimize` and `VACUUM`.
 8. Packages the SQLite file into a ZIP artifact and computes a SHA-256 hash for that ZIP.
 9. Publishes:
@@ -133,7 +137,7 @@ deep; callers recurse to build a full dependency graph.
 Command and DSC-resource searches match `PSCommand_` and `PSDscResource_` tags.
 All tags are now retained. Older caches need a one-time full metadata refresh
 using `PackageCache__FullSyncFromUtc` to recover previously discarded ordinary
-tags; clear the setting afterward to resume incremental sync.
+tags.
 
 ### Artifact publishing
 
@@ -165,9 +169,17 @@ Common settings:
   - How far back to look on the very first run when no checkpoint is stored
   - Defaults to `5` in code; set to `87600` (10 years) in local settings to seed the full catalog
 - `PackageCache__FullSyncFromUtc`
-  - Optional hard override: forces a full re-sync from this UTC timestamp regardless of any stored checkpoint
+  - Optional: re-syncs the catalog from this UTC timestamp, ignoring the stored checkpoint
   - Example: `2010-01-01T00:00:00Z` to re-seed the entire catalog
+  - Each value runs to completion once (resuming across runs if interrupted), then normal incremental sync resumes; change the value to run another full sync
   - Leave empty for normal incremental behavior
+- `PackageCache__MaxSyncDurationMinutes`
+  - Stop fetching after this many minutes and publish progress; the next run continues from the checkpoint
+  - Set below the Functions timeout (for example `8` on a Consumption plan with a 10-minute timeout) so a full catalog sync spans several runs; `0` (default) means no limit
+- `PackageCache__MaxRetries`
+  - Retries per page for transient Gallery failures; defaults to `4`
+- `PackageCache__RetryBaseDelayMilliseconds`
+  - Base delay for exponential backoff with jitter (capped at one minute); a `Retry-After` header takes precedence; defaults to `1000`
 - `PackageCache__StorageMode`
   - `FileSystem` or `Blob`
 - `PackageCache__OutputDirectory`

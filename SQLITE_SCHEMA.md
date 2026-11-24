@@ -157,13 +157,17 @@ for schema compatibility; shared searches now use `tag_value` instead.
 
 ## Updates, sync state, and existing caches
 
-Each ingestion batch upserts packages by name and version in one transaction.
+Each ingestion page upserts packages by name and version in one transaction,
+together with the `last_published_utc` checkpoint, so a stored checkpoint never
+gets ahead of the stored data. The checkpoint only moves forward.
 Existing tag mappings and dependencies for each refreshed version are replaced.
 The tag dictionary can retain unreferenced tags; compaction does not delete them.
 
-The sync service records `last_published_utc` and `last_success_utc` in
-`sync_state`. It uses the publication checkpoint with an overlap window for
-subsequent runs. Dates in package rows are Unix seconds.
+The sync service records `last_published_utc` after every page and
+`last_success_utc` when a run finishes without stopping early. It uses the
+publication checkpoint with an overlap window for subsequent runs. A forced
+full sync also records `full_sync_from_utc`, `full_sync_cursor_utc` (progress),
+and `full_sync_completed`. Dates in package rows are Unix seconds.
 
 Initialization removes redundant `idx_package_ids_id` and
 `idx_packages_package_id_key` indexes and adds the reverse tag-mapping index.
@@ -172,8 +176,9 @@ names directly in `packages` is reset by the existing migration code.
 
 **Older caches have discarded ordinary tags.** A full metadata refresh is
 required to recover them for older package versions. Set
-`PackageCache__FullSyncFromUtc` to a date preceding the desired catalog history
-for one sync, then clear it to resume incremental updates. This re-fetches and
+`PackageCache__FullSyncFromUtc` to a date preceding the desired catalog history.
+That value runs to completion once, resuming across runs if interrupted, and
+later runs return to incremental updates. This re-fetches and
 upserts data; it does not clear an existing compact cache or remove packages
 that no longer appear in the Gallery.
 

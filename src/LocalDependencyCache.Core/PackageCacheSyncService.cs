@@ -1,5 +1,5 @@
 using System.Globalization;
-using System.IO.Compression;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -28,6 +28,10 @@ public sealed class PackageCacheSyncService
         _logger = logger;
     }
 
+    private const string FullSyncFromStateKey = "full_sync_from_utc";
+    private const string FullSyncCursorStateKey = "full_sync_cursor_utc";
+    private const string FullSyncCompletedStateKey = "full_sync_completed";
+
     public async Task<SyncResult> RunAsync(CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(_settings.OutputDirectory);
@@ -42,27 +46,79 @@ public sealed class PackageCacheSyncService
         var cache = new SqlitePackageCache(workingDatabasePath);
         cache.Initialize();
 
-        DateTimeOffset checkpoint;
+        var overlap = TimeSpan.FromMinutes(Math.Abs(_settings.OverlapMinutes));
+        var storedCheckpoint = cache.GetCheckpoint();
+        var fullSync = GetActiveFullSync(cache, overlap);
+        DateTimeOffset fetchFrom;
 
-        if (!string.IsNullOrWhiteSpace(_settings.FullSyncFromUtc)
-            && DateTimeOffset.TryParse(_settings.FullSyncFromUtc, null, System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal, out var forcedStart))
+        if (fullSync is not null)
         {
-            checkpoint = forcedStart;
-            _logger.LogInformation("Full sync override active. Starting from {Checkpoint}.", checkpoint);
+            fetchFrom = fullSync.Value.FetchFrom;
+            _logger.LogInformation("Full sync from {FullSyncFrom} active. Fetching from {FetchFrom}.", fullSync.Value.RequestedFrom, fetchFrom);
         }
         else
         {
-            checkpoint = cache.GetCheckpoint()?.AddMinutes(-Math.Abs(_settings.OverlapMinutes))
+            fetchFrom = storedCheckpoint?.Subtract(overlap)
                 ?? _clock.UtcNow.AddHours(-Math.Abs(_settings.InitialLookBackHours));
-            _logger.LogInformation("Starting cache sync from checkpoint {Checkpoint}.", checkpoint);
+            _logger.LogInformation("Starting cache sync from {FetchFrom}.", fetchFrom);
         }
 
-        var packages = await _galleryClient.GetPackagesAsync(checkpoint, _settings.PageSize, cancellationToken);
-        cache.UpsertPackages(packages);
+        // The checkpoint only moves forward; the overlap window and full syncs re-read older packages.
+        var latestPublished = storedCheckpoint ?? fetchFrom;
+        var fullSyncCursor = fetchFrom;
+        var processed = 0;
+        var isComplete = true;
+        Exception? failure = null;
+        var deadline = _settings.MaxSyncDurationMinutes > 0
+            ? _clock.UtcNow.AddMinutes(_settings.MaxSyncDurationMinutes)
+            : (DateTimeOffset?)null;
 
-        var latestPublished = packages.Select(package => package.PublishedUtc ?? checkpoint).DefaultIfEmpty(checkpoint).Max();
-        cache.SetState("last_published_utc", latestPublished.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
-        cache.SetState("last_success_utc", _clock.UtcNow.UtcDateTime.ToString("O", CultureInfo.InvariantCulture));
+        try
+        {
+            await foreach (var page in _galleryClient.GetPackagePagesAsync(fetchFrom, _settings.PageSize, cancellationToken))
+            {
+                var pageMax = page.Max(package => package.PublishedUtc) ?? fetchFrom;
+                latestPublished = Max(latestPublished, pageMax);
+                fullSyncCursor = Max(fullSyncCursor, pageMax);
+
+                var state = new Dictionary<string, string> { [SqlitePackageCache.LastPublishedStateKey] = FormatUtc(latestPublished) };
+                if (fullSync is not null)
+                {
+                    state[FullSyncCursorStateKey] = FormatUtc(fullSyncCursor);
+                }
+
+                cache.UpsertPackages(page, state);
+                processed += page.Count;
+
+                if (deadline is not null && _clock.UtcNow >= deadline)
+                {
+                    isComplete = false;
+                    _logger.LogWarning(
+                        "Sync time budget of {Minutes} minutes reached after {Processed} packages. Publishing progress; the next run resumes from {Checkpoint}.",
+                        _settings.MaxSyncDurationMinutes, processed, fullSync is not null ? fullSyncCursor : latestPublished);
+                    break;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException && processed > 0)
+        {
+            // Committed pages are consistent with their checkpoint, so publish them before failing the run.
+            isComplete = false;
+            failure = exception;
+            _logger.LogError(exception, "Gallery sync failed after {Processed} packages. Publishing progress before rethrowing.", processed);
+        }
+
+        if (isComplete)
+        {
+            if (fullSync is not null)
+            {
+                cache.SetState(FullSyncCompletedStateKey, "true");
+                cache.DeleteState(FullSyncCursorStateKey);
+            }
+
+            cache.SetState("last_success_utc", FormatUtc(_clock.UtcNow));
+        }
+
         cache.Compact();
 
         var version = latestPublished.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);
@@ -71,8 +127,53 @@ public sealed class PackageCacheSyncService
         var sha256 = ComputeSha256(compressedArtifactPath);
         var manifest = await _artifactStore.PublishAsync(compressedArtifactPath, version, sha256, _clock.UtcNow, cancellationToken);
 
-        return new SyncResult(packages.Count, latestPublished.UtcDateTime.ToString("O", CultureInfo.InvariantCulture), version, compressedArtifactPath, manifest);
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Throw(failure);
+        }
+
+        return new SyncResult(processed, FormatUtc(latestPublished), version, compressedArtifactPath, manifest, isComplete);
     }
+
+    /// <summary>
+    /// A FullSyncFromUtc value runs to completion once, resuming across runs if it is interrupted.
+    /// Changing the value starts a new full sync.
+    /// </summary>
+    private (DateTimeOffset RequestedFrom, DateTimeOffset FetchFrom)? GetActiveFullSync(SqlitePackageCache cache, TimeSpan overlap)
+    {
+        if (string.IsNullOrWhiteSpace(_settings.FullSyncFromUtc)
+            || !DateTimeOffset.TryParse(_settings.FullSyncFromUtc, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var requestedFrom))
+        {
+            return null;
+        }
+
+        var requested = FormatUtc(requestedFrom);
+        if (cache.GetState(FullSyncFromStateKey) != requested)
+        {
+            cache.SetState(FullSyncFromStateKey, requested);
+            cache.DeleteState(FullSyncCursorStateKey);
+            cache.DeleteState(FullSyncCompletedStateKey);
+            return (requestedFrom, requestedFrom);
+        }
+
+        if (cache.GetState(FullSyncCompletedStateKey) == "true")
+        {
+            _logger.LogInformation("Full sync from {FullSyncFrom} already completed; running incremental sync.", requested);
+            return null;
+        }
+
+        var cursorText = cache.GetState(FullSyncCursorStateKey);
+        var fetchFrom = DateTimeOffset.TryParse(cursorText, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var cursor)
+            ? Max(requestedFrom, cursor.Subtract(overlap))
+            : requestedFrom;
+        return (requestedFrom, fetchFrom);
+    }
+
+    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right)
+        => left >= right ? left : right;
+
+    private static string FormatUtc(DateTimeOffset value)
+        => value.UtcDateTime.ToString("O", CultureInfo.InvariantCulture);
 
     private static string ComputeSha256(string path)
     {

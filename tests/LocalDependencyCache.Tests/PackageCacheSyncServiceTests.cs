@@ -95,8 +95,11 @@ public sealed class PackageCacheSyncServiceTests
             _packages = packages;
         }
 
-        public Task<IReadOnlyList<PackageEntry>> GetPackagesAsync(DateTimeOffset checkpointUtc, int pageSize, CancellationToken cancellationToken)
-            => Task.FromResult(_packages);
+        public async IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await Task.Yield();
+            yield return _packages;
+        }
     }
 
     [Fact]

@@ -24,6 +24,22 @@ public sealed record SyncSettings
     /// </summary>
     public string? FullSyncFromUtc { get; init; }
 
+    /// <summary>
+    /// Retries for transient gallery failures (network errors, timeouts, 408, 429, 5xx) per page.
+    /// </summary>
+    public int MaxRetries { get; init; } = 4;
+
+    /// <summary>
+    /// Base delay for exponential backoff between retries. A Retry-After header takes precedence.
+    /// </summary>
+    public int RetryBaseDelayMilliseconds { get; init; } = 1000;
+
+    /// <summary>
+    /// Stop fetching after this many minutes and publish the progress so far; the next run resumes
+    /// from the saved checkpoint. Keep it below the Functions timeout. 0 means no limit.
+    /// </summary>
+    public int MaxSyncDurationMinutes { get; init; }
+
     public string StorageMode { get; init; } = "FileSystem";
 
     public string OutputDirectory { get; init; } = ".artifacts";
@@ -165,16 +181,19 @@ public sealed record CacheManifest(
     string? ETag,
     DateTimeOffset LastModifiedUtc);
 
+/// <param name="IsComplete">False when the run stopped early (time budget or gallery failure) after
+/// publishing partial progress; the next run resumes from <paramref name="CheckpointUtc"/>.</param>
 public sealed record SyncResult(
     int ProcessedPackages,
     string CheckpointUtc,
     string ArtifactVersion,
     string ArtifactPath,
-    CacheManifest Manifest);
+    CacheManifest Manifest,
+    bool IsComplete = true);
 
 public interface IGalleryClient
 {
-    Task<IReadOnlyList<PackageEntry>> GetPackagesAsync(DateTimeOffset checkpointUtc, int pageSize, CancellationToken cancellationToken);
+    IAsyncEnumerable<IReadOnlyList<PackageEntry>> GetPackagePagesAsync(DateTimeOffset checkpointUtc, int pageSize, CancellationToken cancellationToken);
 }
 
 public interface ICacheArtifactStore
