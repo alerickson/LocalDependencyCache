@@ -58,8 +58,9 @@ The main orchestration is in [src/LocalDependencyCache.Core/PackageCacheSyncServ
 
 Per run, it:
 
-1. Creates or reuses the working output directory.
-2. Downloads the current `latest` SQLite artifact when one already exists.
+1. Takes the sync lock (`LockBlobName`). If another run holds it, the run is skipped without changes.
+   If the lock is lost mid-run, the run stops without publishing.
+2. Creates or reuses the working output directory and downloads the current `latest` SQLite artifact when one already exists.
 3. Determines the sync start time using this priority order:
    - `FullSyncFromUtc` if set and not yet completed — re-syncs from that date, resuming from saved progress if an earlier run stopped part-way.
    - Stored checkpoint minus `OverlapMinutes` — normal incremental run.
@@ -190,6 +191,11 @@ Common settings:
   - Published latest ZIP path
 - `PackageCache__ManifestBlobName`
   - Published latest manifest path
+- `PackageCache__LockBlobName`
+  - Lock used to stop overlapping sync runs; defaults to `locks/psgallery-cache.lock`
+  - In Blob mode this blob is leased for the run (60-second lease, renewed every 15 seconds, released at the end; a crashed run's lease expires on its own)
+  - In FileSystem mode it is an exclusive lock file under `OutputDirectory`
+  - A run that cannot take the lock logs a warning and exits without changes
 - `PackageCache__BlobConnectionString`
   - Blob Storage connection string when using connection-string auth
 - `PackageCache__BlobContainerName`
@@ -221,9 +227,20 @@ dotnet test .\LocalDependencyCache.slnx
 Current automated coverage includes:
 
 - Atom feed parsing
-- dependency parsing
+- dependency parsing and NuGet version-range resolution
+- gallery paging, retries, per-page checkpoints, time budget, and full-sync resume
+- sync locking (file lock, lease loss, skipped runs)
 - filesystem artifact publishing
 - command-tag lookup against generated SQLite
+
+The Blob lease tests are skipped unless `LDC_TEST_BLOB_CONNECTION_STRING` is set.
+To run them against the Azurite emulator:
+
+```powershell
+npx -p azurite azurite-blob --silent --location $env:TEMP\azurite   # in a separate terminal
+$env:LDC_TEST_BLOB_CONNECTION_STRING = 'UseDevelopmentStorage=true'
+dotnet test .\LocalDependencyCache.slnx
+```
 
 ### Run the sync locally without Azure Functions Core Tools
 

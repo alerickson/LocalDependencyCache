@@ -13,26 +13,50 @@ public sealed class PackageCacheSyncService
     private readonly SyncSettings _settings;
     private readonly ISystemClock _clock;
     private readonly ILogger<PackageCacheSyncService> _logger;
+    private readonly ISyncLock? _syncLock;
 
     public PackageCacheSyncService(
         IGalleryClient galleryClient,
         ICacheArtifactStore artifactStore,
         IOptions<SyncSettings> settings,
         ISystemClock clock,
-        ILogger<PackageCacheSyncService> logger)
+        ILogger<PackageCacheSyncService> logger,
+        ISyncLock? syncLock = null)
     {
         _galleryClient = galleryClient;
         _artifactStore = artifactStore;
         _settings = settings.Value;
         _clock = clock;
         _logger = logger;
+        _syncLock = syncLock;
     }
 
     private const string FullSyncFromStateKey = "full_sync_from_utc";
     private const string FullSyncCursorStateKey = "full_sync_cursor_utc";
     private const string FullSyncCompletedStateKey = "full_sync_completed";
 
-    public async Task<SyncResult> RunAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Runs one sync. Returns null without changing anything when another run holds the sync lock.
+    /// </summary>
+    public async Task<SyncResult?> RunAsync(CancellationToken cancellationToken)
+    {
+        if (_syncLock is null)
+        {
+            return await RunLockedAsync(cancellationToken);
+        }
+
+        await using var lease = await _syncLock.TryAcquireAsync(cancellationToken);
+        if (lease is null)
+        {
+            _logger.LogWarning("Another sync run holds the lock; skipping this run.");
+            return null;
+        }
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lease.LeaseLost);
+        return await RunLockedAsync(linked.Token);
+    }
+
+    private async Task<SyncResult> RunLockedAsync(CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(_settings.OutputDirectory);
         var workingDatabasePath = Path.Combine(_settings.OutputDirectory, _settings.DatabaseName);
@@ -119,6 +143,7 @@ public sealed class PackageCacheSyncService
             cache.SetState("last_success_utc", FormatUtc(_clock.UtcNow));
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         cache.Compact();
 
         var version = latestPublished.UtcDateTime.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture);

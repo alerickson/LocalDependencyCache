@@ -50,6 +50,11 @@ public sealed record SyncSettings
 
     public string ManifestBlobName { get; init; } = "latest/psgallery-cache.manifest.json";
 
+    /// <summary>
+    /// Blob (or file under OutputDirectory) used to stop overlapping sync runs.
+    /// </summary>
+    public string LockBlobName { get; init; } = "locks/psgallery-cache.lock";
+
     public string? BlobConnectionString { get; init; }
 
     public string? BlobContainerName { get; init; }

@@ -22,6 +22,8 @@ public sealed class IncrementalSyncTests : IDisposable
 
         var result = await CreateService(gallery).RunAsync(CancellationToken.None);
 
+        Assert.NotNull(result);
+
         Assert.True(result.IsComplete);
         Assert.Equal(3, result.ProcessedPackages);
         var published = await DownloadPublishedAsync();
@@ -48,6 +50,8 @@ public sealed class IncrementalSyncTests : IDisposable
 
         var result = await CreateService(first, maxMinutes: 10).RunAsync(CancellationToken.None);
 
+        Assert.NotNull(result);
+
         Assert.False(result.IsComplete);
         Assert.Equal(2, result.ProcessedPackages);
         Assert.Equal(2, first.PagesServed);
@@ -58,6 +62,7 @@ public sealed class IncrementalSyncTests : IDisposable
         _clock.UtcNow = Now;
         var second = new ScriptedGallery(Page(("C", "2026-06-04T11:00:00Z")));
         result = await CreateService(second, maxMinutes: 10).RunAsync(CancellationToken.None);
+        Assert.NotNull(result);
 
         Assert.True(result.IsComplete);
         Assert.Equal(DateTimeOffset.Parse("2026-06-04T10:25:00Z"), Assert.Single(second.RequestedFrom));
@@ -124,6 +129,7 @@ public sealed class IncrementalSyncTests : IDisposable
             BeforePage = index => { if (index == 1) _clock.UtcNow = Now.AddMinutes(30); }
         };
         var result = await CreateService(first, maxMinutes: 10, fullSyncFrom: fullSyncFrom).RunAsync(CancellationToken.None);
+        Assert.NotNull(result);
 
         Assert.False(result.IsComplete);
         Assert.Equal(DateTimeOffset.Parse(fullSyncFrom), Assert.Single(first.RequestedFrom));
@@ -132,6 +138,7 @@ public sealed class IncrementalSyncTests : IDisposable
         _clock.UtcNow = Now;
         var second = new ScriptedGallery(Page(("Old3", "2020-01-01T00:00:00Z")), Page(("Recent", "2026-06-04T10:00:00Z")));
         result = await CreateService(second, maxMinutes: 10, fullSyncFrom: fullSyncFrom).RunAsync(CancellationToken.None);
+        Assert.NotNull(result);
 
         Assert.True(result.IsComplete);
         Assert.Equal(DateTimeOffset.Parse("2017-12-31T23:55:00Z"), Assert.Single(second.RequestedFrom));

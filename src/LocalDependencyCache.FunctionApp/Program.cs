@@ -25,6 +25,7 @@ var hostBuilder = new HostBuilder()
         services.AddSingleton<ISystemClock, SystemClock>();
         services.AddHttpClient<IGalleryClient, GalleryClient>();
         services.AddSingleton<ICacheArtifactStore>(serviceProvider => CreateArtifactStore(serviceProvider));
+        services.AddSingleton<ISyncLock>(serviceProvider => CreateSyncLock(serviceProvider));
         services.AddSingleton<PackageCacheSyncService>();
     });
 
@@ -41,6 +42,12 @@ if (args.Any(argument => string.Equals(argument, "--run-once", StringComparison.
     var logger = scope.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("LocalRunOnce");
     var service = scope.ServiceProvider.GetRequiredService<PackageCacheSyncService>();
     var result = await service.RunAsync(CancellationToken.None);
+    if (result is null)
+    {
+        logger.LogWarning("Run-once skipped: another sync run holds the lock.");
+        return;
+    }
+
     logger.LogInformation("Run-once completed (complete: {IsComplete}). Packages: {Packages}. Artifact version: {Version}. Artifact: {ArtifactPath}", result.IsComplete, result.ProcessedPackages, result.ArtifactVersion, result.ArtifactPath);
     return;
 }
@@ -68,28 +75,44 @@ static ICacheArtifactStore CreateArtifactStore(IServiceProvider serviceProvider)
 {
     var settings = serviceProvider.GetRequiredService<IOptions<SyncSettings>>().Value;
 
-    if (string.Equals(settings.StorageMode, "Blob", StringComparison.OrdinalIgnoreCase))
+    if (IsBlobMode(settings))
     {
-        BlobContainerClient containerClient;
-
-        if (!string.IsNullOrWhiteSpace(settings.BlobConnectionString) && !string.IsNullOrWhiteSpace(settings.BlobContainerName))
-        {
-            containerClient = new BlobContainerClient(settings.BlobConnectionString, settings.BlobContainerName);
-        }
-        else if (!string.IsNullOrWhiteSpace(settings.BlobContainerUrl))
-        {
-            containerClient = new BlobContainerClient(new Uri(settings.BlobContainerUrl), new DefaultAzureCredential());
-        }
-        else
-        {
-            throw new InvalidOperationException("Blob storage mode requires PackageCache__BlobConnectionString and PackageCache__BlobContainerName, or PackageCache__BlobContainerUrl.");
-        }
-
         var baseUrl = settings.BlobBaseUrl ?? settings.BlobContainerUrl ?? throw new InvalidOperationException("Blob storage mode requires PackageCache__BlobBaseUrl or PackageCache__BlobContainerUrl.");
-        return new BlobArtifactStore(containerClient, settings.LatestBlobName, settings.ManifestBlobName, baseUrl);
+        return new BlobArtifactStore(CreateContainerClient(settings), settings.LatestBlobName, settings.ManifestBlobName, baseUrl);
     }
 
     return new FileSystemArtifactStore(settings.OutputDirectory, settings.LatestBlobName, settings.ManifestBlobName, settings.BlobBaseUrl);
+}
+
+static ISyncLock CreateSyncLock(IServiceProvider serviceProvider)
+{
+    var settings = serviceProvider.GetRequiredService<IOptions<SyncSettings>>().Value;
+
+    if (IsBlobMode(settings))
+    {
+        var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger<BlobSyncLock>();
+        return new BlobSyncLock(CreateContainerClient(settings), settings.LockBlobName, logger);
+    }
+
+    return new FileSystemSyncLock(Path.Combine(settings.OutputDirectory, settings.LockBlobName.Replace('/', Path.DirectorySeparatorChar)));
+}
+
+static bool IsBlobMode(SyncSettings settings)
+    => string.Equals(settings.StorageMode, "Blob", StringComparison.OrdinalIgnoreCase);
+
+static BlobContainerClient CreateContainerClient(SyncSettings settings)
+{
+    if (!string.IsNullOrWhiteSpace(settings.BlobConnectionString) && !string.IsNullOrWhiteSpace(settings.BlobContainerName))
+    {
+        return new BlobContainerClient(settings.BlobConnectionString, settings.BlobContainerName);
+    }
+
+    if (!string.IsNullOrWhiteSpace(settings.BlobContainerUrl))
+    {
+        return new BlobContainerClient(new Uri(settings.BlobContainerUrl), new DefaultAzureCredential());
+    }
+
+    throw new InvalidOperationException("Blob storage mode requires PackageCache__BlobConnectionString and PackageCache__BlobContainerName, or PackageCache__BlobContainerUrl.");
 }
 
 static Dictionary<string, string?> LoadLocalSettingsValues()

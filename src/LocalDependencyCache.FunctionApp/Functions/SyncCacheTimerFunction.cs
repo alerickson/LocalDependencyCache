@@ -24,7 +24,11 @@ public sealed class SyncCacheTimerFunction
         }
 
         var result = await _syncService.RunAsync(cancellationToken);
-        if (result.IsComplete)
+        if (result is null)
+        {
+            _logger.LogWarning("Sync skipped: another run holds the sync lock.");
+        }
+        else if (result.IsComplete)
         {
             _logger.LogInformation("Sync completed. Packages: {Packages}. Artifact version: {Version}.", result.ProcessedPackages, result.ArtifactVersion);
         }

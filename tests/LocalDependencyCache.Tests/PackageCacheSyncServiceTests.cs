@@ -50,6 +50,8 @@ public sealed class PackageCacheSyncServiceTests
 
             var result = await service.RunAsync(CancellationToken.None);
 
+            Assert.NotNull(result);
+
             Assert.Equal(1, result.ProcessedPackages);
             Assert.NotEmpty(result.Manifest.ArtifactUrl);
             Assert.EndsWith(".zip", result.ArtifactPath, StringComparison.OrdinalIgnoreCase);
@@ -144,6 +146,8 @@ public sealed class PackageCacheSyncServiceTests
                 NullLogger<PackageCacheSyncService>.Instance);
 
             var result = await service.RunAsync(CancellationToken.None);
+
+            Assert.NotNull(result);
             Assert.Equal(1, result.ProcessedPackages);
 
             var dbPath = Path.Combine(rootPath, "psgallery-cache.sqlite");

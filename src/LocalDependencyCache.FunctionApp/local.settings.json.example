@@ -17,6 +17,7 @@
     "PackageCache__DatabaseName": "psgallery-cache.sqlite",
     "PackageCache__LatestBlobName": "latest/psgallery-cache.zip",
     "PackageCache__ManifestBlobName": "latest/psgallery-cache.manifest.json",
+    "PackageCache__LockBlobName": "locks/psgallery-cache.lock",
     "PackageCache__BlobConnectionString": "",
     "PackageCache__BlobContainerName": "",
     "PackageCache__BlobContainerUrl": "",
