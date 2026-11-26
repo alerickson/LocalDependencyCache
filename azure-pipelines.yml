@@ -1,0 +1,157 @@
+# Azure DevOps pipeline: build and test, then deploy infrastructure (Bicep) and the Function App,
+# and optionally release the NuGet package. Pull requests are validated by the CI pipeline (.ci/ci.yml).
+#
+# Prerequisites (see README "Deployment"):
+#   - An Azure Resource Manager service connection (workload identity federation recommended)
+#     named by `azureServiceConnection`, with Contributor and Role Based Access Control
+#     Administrator (or User Access Administrator) on the target subscription.
+#   - An Azure DevOps environment named by `deployEnvironment`; add approvals there if needed.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+parameters:
+  - name: deploy
+    displayName: Deploy to Azure after a successful build (main only)
+    type: boolean
+    default: true
+  - name: release
+    displayName: Release the LocalDependencyCache.Query NuGet package (main only, manual approvals)
+    type: boolean
+    default: false
+
+variables:
+  - name: azureServiceConnection
+    value: LocalDependencyCache-Azure
+  - name: deployEnvironment
+    value: localdependencycache-prod
+  - name: location
+    value: westus2
+  - name: buildConfiguration
+    value: Release
+  - name: dotnetVersion
+    value: 8.0.x
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      # Linux matches the Azure Functions host, so it also builds a real cache from the live Gallery.
+      - template: .ci/test.yml
+        parameters:
+          jobName: TestLinux
+          imageName: ubuntu-latest
+          displayName: Build and test on Linux
+          buildConfiguration: ${{ variables.buildConfiguration }}
+          dotnetVersion: ${{ variables.dotnetVersion }}
+          runGallerySmokeTest: true
+
+      - template: .ci/test.yml
+        parameters:
+          jobName: TestWindows
+          imageName: windows-latest
+          displayName: Build and test on Windows
+          buildConfiguration: ${{ variables.buildConfiguration }}
+          dotnetVersion: ${{ variables.dotnetVersion }}
+
+      - template: .ci/build.yml
+        parameters:
+          jobName: Package
+          displayName: Package Function App and NuGet package, validate Bicep
+          buildConfiguration: ${{ variables.buildConfiguration }}
+          dotnetVersion: ${{ variables.dotnetVersion }}
+
+  - stage: Release
+    displayName: Release NuGet package
+    dependsOn: Build
+    condition: >
+      and(
+        succeeded(),
+        eq('${{ parameters.release }}', 'true'),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - template: .ci/release.yml
+
+  - stage: Deploy
+    displayName: Deploy to Azure
+    dependsOn: Build
+    condition: >
+      and(
+        succeeded(),
+        eq('${{ parameters.deploy }}', 'true'),
+        ne(variables['Build.Reason'], 'PullRequest'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      )
+    jobs:
+      - deployment: DeployAzure
+        displayName: Deploy infrastructure and Function App
+        pool:
+          vmImage: ubuntu-latest
+        environment: ${{ variables.deployEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Deploy infrastructure (Bicep)
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      outputs=$(az deployment sub create \
+                        --name "localdependencycache-$(Build.BuildId)" \
+                        --location "$(location)" \
+                        --parameters "$(Pipeline.Workspace)/infra/main.bicepparam" \
+                        --parameters location="$(location)" \
+                        --query properties.outputs \
+                        --output json)
+
+                      functionAppName=$(echo "$outputs" | jq -r '.functionAppName.value')
+                      resourceGroupName=$(echo "$outputs" | jq -r '.resourceGroupName.value')
+                      manifestUrl=$(echo "$outputs" | jq -r '.manifestUrl.value')
+
+                      echo "Function App: $functionAppName"
+                      echo "Manifest URL: $manifestUrl"
+                      echo "##vso[task.setvariable variable=functionAppName]$functionAppName"
+                      echo "##vso[task.setvariable variable=resourceGroupName]$resourceGroupName"
+                      echo "##vso[task.setvariable variable=manifestUrl]$manifestUrl"
+
+                - task: AzureFunctionApp@2
+                  displayName: Deploy Function App code
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    appType: functionAppLinux
+                    isFlexConsumption: true
+                    appName: $(functionAppName)
+                    package: $(Pipeline.Workspace)/functionapp/functionapp.zip
+
+                - task: AzureCLI@2
+                  displayName: Verify Function App
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+                      state=$(az functionapp show --name "$(functionAppName)" --resource-group "$(resourceGroupName)" --query state --output tsv)
+                      echo "Function App state: $state"
+                      # Function indexing can lag briefly behind a Flex Consumption deployment.
+                      for attempt in $(seq 1 12); do
+                        functions=$(az functionapp function list --name "$(functionAppName)" --resource-group "$(resourceGroupName)" --query "[].name" --output tsv)
+                        if echo "$functions" | grep -q "SyncCacheTimerFunction"; then
+                          echo "Functions: $functions"
+                          echo "Cache manifest (available after the first sync run): $(manifestUrl)"
+                          exit 0
+                        fi
+                        sleep 10
+                      done
+                      echo "##vso[task.logissue type=error]SyncCacheTimerFunction was not found after deployment."
+                      exit 1

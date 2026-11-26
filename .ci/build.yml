@@ -1,0 +1,87 @@
+# Job template: package LocalDependencyCache and publish the pipeline artifacts.
+#
+# Artifacts:
+#   functionapp - zipped Function App, deployed by azure-pipelines.yml
+#   infra       - Bicep templates, deployed by azure-pipelines.yml
+#   nupkg       - LocalDependencyCache.Query NuGet package (+ symbols), released by .ci/release.yml
+#
+# Usage, from a stage's jobs list:
+#   - template: .ci/build.yml
+
+parameters:
+  - name: jobName
+    type: string
+    default: BuildPkg
+  - name: displayName
+    type: string
+    default: Build packages
+  - name: imageName
+    type: string
+    default: ubuntu-latest
+  - name: buildConfiguration
+    type: string
+    default: Release
+  - name: dotnetVersion
+    type: string
+    default: 8.0.x
+
+jobs:
+- job: ${{ parameters.jobName }}
+  displayName: ${{ parameters.displayName }}
+  pool:
+    vmImage: ${{ parameters.imageName }}
+  steps:
+  - checkout: self
+
+  - task: UseDotNet@2
+    displayName: Install .NET SDK ${{ parameters.dotnetVersion }}
+    inputs:
+      packageType: sdk
+      version: ${{ parameters.dotnetVersion }}
+
+  - pwsh: |
+      Get-ChildItem -Path env: | Out-String -Width 9999 -Stream | Write-Verbose -Verbose
+    displayName: Capture environment for build
+    condition: succeededOrFailed()
+
+  - pwsh: |
+      $output = Join-Path $env:AGENT_TEMPDIRECTORY 'functionapp'
+      dotnet publish src/LocalDependencyCache.FunctionApp/LocalDependencyCache.FunctionApp.csproj --configuration ${{ parameters.buildConfiguration }} --output $output
+      if ($LASTEXITCODE) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
+    displayName: Publish Function App
+
+  - task: ArchiveFiles@2
+    displayName: Zip Function App
+    inputs:
+      rootFolderOrFile: $(Agent.TempDirectory)/functionapp
+      includeRootFolder: false
+      archiveType: zip
+      archiveFile: $(Build.ArtifactStagingDirectory)/functionapp/functionapp.zip
+
+  - pwsh: |
+      $output = Join-Path $env:BUILD_ARTIFACTSTAGINGDIRECTORY 'nupkg'
+      dotnet pack src/LocalDependencyCache.Query/LocalDependencyCache.Query.csproj --configuration ${{ parameters.buildConfiguration }} --output $output
+      if ($LASTEXITCODE) { throw "dotnet pack failed with exit code $LASTEXITCODE." }
+      Get-ChildItem -Path $output | ForEach-Object { Write-Host "$($_.Name) ($($_.Length) bytes)" }
+    displayName: Pack LocalDependencyCache.Query
+
+  - pwsh: |
+      az bicep install
+      if ($LASTEXITCODE) { throw "az bicep install failed with exit code $LASTEXITCODE." }
+      az bicep build --file infra/main.bicep --stdout | Out-Null
+      if ($LASTEXITCODE) { throw "Bicep build failed with exit code $LASTEXITCODE." }
+      az bicep lint --file infra/main.bicep
+      if ($LASTEXITCODE) { throw "Bicep lint failed with exit code $LASTEXITCODE." }
+    displayName: Validate Bicep
+
+  - publish: $(Build.ArtifactStagingDirectory)/functionapp
+    displayName: Publish artifact - functionapp
+    artifact: functionapp
+
+  - publish: infra
+    displayName: Publish artifact - infra
+    artifact: infra
+
+  - publish: $(Build.ArtifactStagingDirectory)/nupkg
+    displayName: Publish artifact - nupkg
+    artifact: nupkg

@@ -8,6 +8,20 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <PackageId>LocalDependencyCache.Query</PackageId>
+    <!-- Bump before each release; a pushed version cannot be replaced. -->
+    <Version>0.1.0-preview.1</Version>
+    <Authors>Microsoft</Authors>
+    <Description>Read-only queries over the LocalDependencyCache SQLite cache of PowerShell Gallery metadata: name, version, tag, command, and DSC resource search, plus NuGet version-range dependency resolution.</Description>
+    <PackageTags>PowerShell;PSResourceGet;PowerShellGallery;SQLite</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/PowerShell/LocalDependencyCache</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
     <PackageReference Include="NuGet.Versioning" Version="6.12.1" />

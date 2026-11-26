@@ -1,0 +1,91 @@
+# CI pipeline: build packages, run compliance scans, and test on Windows, Linux, and macOS.
+# Deployment and NuGet releases run from azure-pipelines.yml.
+
+name: $(BuildDefinitionName)-$(date:yyMM).$(date:dd)$(rev:rrr)
+
+trigger:
+  # Batch merge builds together while a merge build is running
+  batch: true
+  branches:
+    include:
+    - main
+
+pr:
+  branches:
+    include:
+    - main
+
+resources:
+  repositories:
+  - repository: ComplianceRepo
+    type: github
+    endpoint: ComplianceGHRepo
+    name: PowerShell/compliance
+
+variables:
+  - name: buildConfiguration
+    value: Release
+  - name: dotnetVersion
+    value: 8.0.x
+
+stages:
+- stage: Build
+  displayName: Build LocalDependencyCache packages
+  jobs:
+  - template: build.yml
+    parameters:
+      jobName: BuildPkg
+      displayName: Build packages
+      buildConfiguration: ${{ variables.buildConfiguration }}
+      dotnetVersion: ${{ variables.dotnetVersion }}
+
+- stage: Compliance
+  displayName: Compliance
+  dependsOn: Build
+  jobs:
+  - job: ComplianceJob
+    pool:
+      vmImage: windows-latest
+    steps:
+    - checkout: self
+      clean: true
+    - checkout: ComplianceRepo
+      clean: true
+    - download: current
+      artifact: nupkg
+    - download: current
+      artifact: functionapp
+    - template: ci-compliance.yml@ComplianceRepo
+      parameters:
+        # credscan
+        suppressionsFile: ''
+
+- stage: Test
+  displayName: Test packages
+  dependsOn: Build
+  jobs:
+  - template: test.yml
+    parameters:
+      jobName: TestPkgWin
+      displayName: .NET on Windows
+      imageName: windows-latest
+      buildConfiguration: ${{ variables.buildConfiguration }}
+      dotnetVersion: ${{ variables.dotnetVersion }}
+
+  # Linux matches the Azure Functions host, so it also builds a real cache from the live Gallery.
+  - template: test.yml
+    parameters:
+      jobName: TestPkgUbuntu
+      displayName: .NET on Ubuntu
+      imageName: ubuntu-latest
+      buildConfiguration: ${{ variables.buildConfiguration }}
+      dotnetVersion: ${{ variables.dotnetVersion }}
+      runGallerySmokeTest: true
+
+  - template: test.yml
+    parameters:
+      jobName: TestPkgMacOS
+      displayName: .NET on macOS
+      imageName: macOS-latest
+      buildConfiguration: ${{ variables.buildConfiguration }}
+      dotnetVersion: ${{ variables.dotnetVersion }}

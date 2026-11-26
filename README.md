@@ -33,7 +33,10 @@ The intended flow is:
 - `infra`
   - Bicep templates for the Azure resources (Function App, storage, Front Door, monitoring)
 - `azure-pipelines.yml`
-  - Azure DevOps build, test, and deploy pipeline
+  - Azure DevOps deployment and release pipeline (pushes to `main`)
+- `.ci`
+  - `ci.yml`: Azure DevOps CI pipeline (PRs and `main`: build, compliance, tests on three OSes)
+  - `build.yml`, `test.yml`, `release.yml`: job templates shared by both pipelines
 
 ## Implementation overview
 
@@ -547,16 +550,45 @@ Template parameters are set in [infra/main.bicepparam](infra/main.bicepparam): `
    subscription, because the template creates the resource group and role assignments.
 2. Create an **environment** named `localdependencycache-prod` (or change `deployEnvironment`) and add
    approvals or checks if deployments should be gated.
-3. Create a pipeline from `azure-pipelines.yml` in this repository.
+3. Create a pipeline from `azure-pipelines.yml` (deployment and release) and another from
+   `.ci/ci.yml` (CI) in this repository. The CI pipeline's Compliance stage also needs a GitHub service
+   connection named `ComplianceGHRepo` with access to `PowerShell/compliance`.
 
-### Pipeline behavior
+### Pipelines
 
-- **Build stage** (every PR and push to `main`): restores, builds, and tests in Release with Azurite
-  running so the Blob lease and publishing tests execute; publishes test results; validates and lints
-  the Bicep; publishes `functionapp` (zipped Function App) and `infra` artifacts.
-- **Deploy stage** (pushes to `main` only, skippable with the `deploy` run parameter): runs
+There are two pipelines, built from four job templates in [.ci](.ci):
+
+| Template | Job |
+|---|---|
+| [build.yml](.ci/build.yml) | Publishes and zips the Function App, packs `LocalDependencyCache.Query`, validates and lints the Bicep, and publishes the `functionapp`, `infra`, and `nupkg` artifacts |
+| [test.yml](.ci/test.yml) | Restores, builds, and tests in Release with Azurite running; publishes test results; fails if any test was skipped (so the Blob tests cannot silently skip); optionally runs `--run-once` against the live Gallery and verifies the manifest, the artifact's SHA-256, and the SQLite file inside it |
+| [release.yml](.ci/release.yml) | Pushes the `nupkg` artifact to the PSCore-Release ADO feed and then NuGet.org, each after a manual approval |
+
+**CI pipeline ([.ci/ci.yml](.ci/ci.yml))**, on every PR to `main` and batched pushes to `main`:
+
+- **Build:** `build.yml`.
+- **Compliance:** the shared `ci-compliance.yml` template from `PowerShell/compliance`, over the
+  `nupkg` and `functionapp` artifacts.
+- **Test:** `test.yml` on Windows, Ubuntu (with the live Gallery smoke test, since Azure runs Linux),
+  and macOS.
+
+**Deployment pipeline ([azure-pipelines.yml](azure-pipelines.yml))**, on pushes to `main` only:
+
+- **Build stage:** `test.yml` on Linux (with the smoke test) and Windows, plus `build.yml`.
+- **Deploy stage** (skippable with the `deploy` run parameter): runs
   `az deployment sub create`, deploys the code with `AzureFunctionApp@2` (`isFlexConsumption: true`),
   and verifies `SyncCacheTimerFunction` is registered.
+- **Release stage** (only when the `release` run parameter is set; off by default): `release.yml`.
+  Each approval times out (rejects) after 2 days. Bump `<Version>` in the project file before
+  releasing; a pushed version cannot be replaced.
+
+`.ci/release.yml` parameters mirror the PSResourceGet release template (job names, approval text) and add
+`serviceConnection1` (default `PSCoreReleasePush`), `serviceConnection2` (default `NuGetOrgPush`),
+`packageName`, `poolName` (default `1ES`), and `imageOverride` (default `PSMMS2019-Secure`). The release jobs
+need those NuGet service connections and that agent pool to exist in the Azure DevOps project.
+
+`.ci/test.yml` parameters: `jobName`, `imageName`, `displayName`, `buildConfiguration`, `dotnetVersion`,
+`runBlobTests` (default `true`), and `runGallerySmokeTest` (default `false`).
 
 ### First deployment
 

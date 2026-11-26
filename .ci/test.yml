@@ -1,0 +1,156 @@
+# Job template: build and test LocalDependencyCache on one agent image.
+#
+# Usage, from a stage's jobs list:
+#   - template: .ci/test.yml
+#     parameters:
+#       jobName: TestWindows
+#       imageName: windows-latest
+#       displayName: Test on Windows
+
+parameters:
+  - name: jobName
+    type: string
+    default: TestPkgWin
+  - name: imageName
+    type: string
+    default: windows-latest
+  - name: displayName
+    type: string
+    default: Build and test on Windows
+  - name: buildConfiguration
+    type: string
+    default: Release
+  - name: dotnetVersion
+    type: string
+    default: 8.0.x
+  # Runs the Blob lease and publishing tests against Azurite. When false they are skipped.
+  - name: runBlobTests
+    type: boolean
+    default: true
+  # Builds a real cache from the live PowerShell Gallery with --run-once and verifies the output.
+  - name: runGallerySmokeTest
+    type: boolean
+    default: false
+
+jobs:
+- job: ${{ parameters.jobName }}
+  displayName: ${{ parameters.displayName }}
+  pool:
+    vmImage: ${{ parameters.imageName }}
+  steps:
+  - checkout: self
+
+  - task: UseDotNet@2
+    displayName: Install .NET SDK ${{ parameters.dotnetVersion }}
+    inputs:
+      packageType: sdk
+      version: ${{ parameters.dotnetVersion }}
+
+  - pwsh: |
+      $sdk = dotnet --version
+      Write-Host ".NET SDK: $sdk"
+      Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+      if ([version]($sdk -replace '-.*$') -lt [version]'8.0') {
+          throw "Build requires the .NET 8 SDK or newer; found $sdk."
+      }
+    displayName: Verify .NET SDK requirements
+
+  - ${{ if parameters.runBlobTests }}:
+    - pwsh: |
+        npm install --global azurite --no-fund --no-audit
+        if ($LASTEXITCODE) { throw "npm install azurite failed with exit code $LASTEXITCODE." }
+
+        # -CommandType Application picks the native shim (azurite-blob.cmd on Windows), not the .ps1 wrapper.
+        $azurite = Get-Command azurite-blob -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $location = Join-Path $env:AGENT_TEMPDIRECTORY 'azurite'
+        $null = New-Item -ItemType Directory -Path $location -Force
+
+        Write-Verbose -Verbose "Starting $($azurite.Source)"
+        Start-Process -FilePath $azurite.Source -ArgumentList '--silent', '--location', $location, '--blobPort', '10000', '--skipApiVersionCheck'
+
+        for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            if (Test-Connection -TargetName 127.0.0.1 -TcpPort 10000 -Quiet -TimeoutSeconds 1) {
+                Write-Host 'Azurite is listening on port 10000.'
+                return
+            }
+            Start-Sleep -Seconds 1
+        }
+
+        throw 'Azurite did not start within 60 seconds.'
+      displayName: Start Azurite blob emulator
+
+  - pwsh: |
+      dotnet restore LocalDependencyCache.slnx
+      if ($LASTEXITCODE) { throw "dotnet restore failed with exit code $LASTEXITCODE." }
+    displayName: Restore
+
+  - pwsh: |
+      dotnet build LocalDependencyCache.slnx --configuration ${{ parameters.buildConfiguration }} --no-restore
+      if ($LASTEXITCODE) { throw "dotnet build failed with exit code $LASTEXITCODE." }
+    displayName: Build
+
+  - pwsh: |
+      $resultsDirectory = Join-Path $env:AGENT_TEMPDIRECTORY 'TestResults'
+      dotnet test LocalDependencyCache.slnx `
+          --configuration ${{ parameters.buildConfiguration }} `
+          --no-build `
+          --logger trx `
+          --results-directory $resultsDirectory
+      if ($LASTEXITCODE) { throw "dotnet test failed with exit code $LASTEXITCODE." }
+    displayName: Execute unit and integration tests
+    env:
+      ${{ if parameters.runBlobTests }}:
+        LDC_TEST_BLOB_CONNECTION_STRING: UseDevelopmentStorage=true
+      ${{ else }}:
+        LDC_TEST_BLOB_CONNECTION_STRING: ''
+
+  - task: PublishTestResults@2
+    displayName: Publish test results
+    condition: succeededOrFailed()
+    inputs:
+      testResultsFormat: VSTest
+      testResultsFiles: '**/*.trx'
+      searchFolder: $(Agent.TempDirectory)/TestResults
+      testRunTitle: ${{ parameters.displayName }}
+      failTaskOnFailedTests: true
+
+  # Blob tests skip themselves when no emulator is configured; make sure that never happens silently.
+  - pwsh: |
+      $resultsDirectory = Join-Path $env:AGENT_TEMPDIRECTORY 'TestResults'
+      $results = Get-ChildItem -Path $resultsDirectory -Filter *.trx -Recurse |
+          ForEach-Object { ([xml](Get-Content -Path $_.FullName -Raw)).TestRun.Results.UnitTestResult }
+      $skipped = @($results | Where-Object outcome -eq 'NotExecuted')
+
+      Write-Host "Tests: $(@($results).Count) total, $($skipped.Count) skipped."
+      if ($skipped.Count -gt 0) {
+          $skipped | ForEach-Object { Write-Host "  skipped: $($_.testName)" }
+          throw "$($skipped.Count) test(s) were skipped, but runBlobTests is enabled."
+      }
+    displayName: Verify no tests were skipped
+    condition: and(succeeded(), ${{ parameters.runBlobTests }})
+
+  - ${{ if parameters.runGallerySmokeTest }}:
+    - pwsh: |
+        $outputDirectory = Join-Path $env:AGENT_TEMPDIRECTORY 'gallery-smoke'
+        $env:PackageCache__GalleryEndpoint = 'https://www.powershellgallery.com/api/v2/Search()'
+        $env:PackageCache__StorageMode = 'FileSystem'
+        $env:PackageCache__OutputDirectory = $outputDirectory
+
+        dotnet run --project src/LocalDependencyCache.FunctionApp --configuration ${{ parameters.buildConfiguration }} --no-build -- --run-once
+        if ($LASTEXITCODE) { throw "--run-once failed with exit code $LASTEXITCODE." }
+
+        $manifestPath = Join-Path $outputDirectory 'latest/psgallery-cache.manifest.json'
+        if (-not (Test-Path -Path $manifestPath)) { throw "No manifest was published at $manifestPath." }
+        $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+        Write-Host "Manifest version $($manifest.version), artifact $($manifest.artifactUrl)"
+
+        $hash = (Get-FileHash -Path $manifest.artifactUrl -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($hash -ne $manifest.sha256) { throw "Artifact SHA-256 $hash does not match the manifest ($($manifest.sha256))." }
+
+        $extracted = Join-Path $outputDirectory 'extracted'
+        Expand-Archive -Path $manifest.artifactUrl -DestinationPath $extracted -Force
+        $database = Get-ChildItem -Path $extracted -Filter *.sqlite | Select-Object -First 1
+        if (-not $database -or $database.Length -eq 0) { throw 'The published artifact does not contain a SQLite database.' }
+
+        Write-Host ("Artifact {0:N0} bytes; database {1:N0} bytes." -f (Get-Item $manifest.artifactUrl).Length, $database.Length)
+      displayName: Smoke test against the live PowerShell Gallery

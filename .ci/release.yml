@@ -1,0 +1,162 @@
+# Job template: release the LocalDependencyCache.Query NuGet package, with a manual approval before each feed.
+#
+# Expects a pipeline artifact named `nupkg` containing LocalDependencyCache.Query.<version>.nupkg
+# (produced by the Package job in azure-pipelines.yml).
+#
+# Usage, from a stage's jobs list:
+#   - template: .ci/release.yml
+
+parameters:
+  - name: validationJob1
+    type: string
+    default: approvalToADO
+  - name: validationJob2
+    type: string
+    default: approvalToNuGet
+  - name: jobName1
+    type: string
+    default: pscorerelease_release
+  - name: jobName2
+    type: string
+    default: nuget_release
+  - name: displayValidationJob1
+    type: string
+    default: Manual approval to PSCore-Release feed in ADO
+  - name: displayValidationJob2
+    type: string
+    default: Manual approval to NuGet.org
+  - name: instructionsValidationJob1
+    type: string
+    default: Approve if ready to release LocalDependencyCache.Query to PSCore-Release
+  - name: instructionsValidationJob2
+    type: string
+    default: Approve if ready to release LocalDependencyCache.Query to NuGet.org
+  - name: displayNameJob1
+    type: string
+    default: Release LocalDependencyCache.Query to PSCore-Release
+  - name: displayNameJob2
+    type: string
+    default: Release LocalDependencyCache.Query to NuGet.org
+  - name: serviceConnection1
+    displayName: NuGet service connection for the first feed
+    type: string
+    default: PSCoreReleasePush
+  - name: serviceConnection2
+    displayName: NuGet service connection for the second feed
+    type: string
+    default: NuGetOrgPush
+  - name: packageName
+    type: string
+    default: LocalDependencyCache.Query
+  - name: poolName
+    type: string
+    default: 1ES
+  - name: imageOverride
+    type: string
+    default: PSMMS2019-Secure
+
+jobs:
+- job: ${{ parameters.validationJob1 }}
+  displayName: ${{ parameters.displayValidationJob1 }}
+  pool: server
+  timeoutInMinutes: 4320 # job times out in 3 days
+  steps:
+  - task: ManualValidation@0
+    displayName: ${{ parameters.displayValidationJob1 }}
+    timeoutInMinutes: 2880 # 2 days
+    inputs:
+      instructions: ${{ parameters.instructionsValidationJob1 }}
+      onTimeout: reject
+
+- job: ${{ parameters.jobName1 }}
+  dependsOn: ${{ parameters.validationJob1 }}
+  pool:
+    name: ${{ parameters.poolName }}
+    demands:
+    - ImageOverride -equals ${{ parameters.imageOverride }}
+  displayName: ${{ parameters.displayNameJob1 }}
+  steps:
+  - checkout: none
+
+  - task: DownloadPipelineArtifact@2
+    displayName: Download ${{ parameters.packageName }} package artifact
+    inputs:
+      artifact: nupkg
+      patterns: '**/*.nupkg'
+      downloadPath: $(Pipeline.Workspace)/nuget
+
+  - pwsh: |
+      $packages = @(Get-ChildItem -Path '$(Pipeline.Workspace)/nuget' -Filter '${{ parameters.packageName }}.*.nupkg' -Recurse)
+      if ($packages.Count -ne 1) {
+          throw "Expected exactly one ${{ parameters.packageName }} package; found $($packages.Count): $($packages.Name -join ', ')"
+      }
+
+      $package = $packages[0].FullName
+      Write-Host "Package: $package"
+      $vstsCommandString = "vso[task.setvariable variable=NugetPkgPath]$package"
+      Write-Host "sending $vstsCommandString"
+      Write-Host "##$vstsCommandString"
+    displayName: Capture ${{ parameters.packageName }} package path and set environment variable
+
+  - task: NuGetAuthenticate@1
+    inputs:
+      nuGetServiceConnections: ${{ parameters.serviceConnection1 }}
+
+  - task: NuGetCommand@2
+    displayName: Push ${{ parameters.packageName }} to PowerShell ADO feed
+    inputs:
+      command: push
+      packagesToPush: $(NugetPkgPath)
+      nuGetFeedType: external
+      publishFeedCredentials: ${{ parameters.serviceConnection1 }}
+
+- job: ${{ parameters.validationJob2 }}
+  dependsOn: ${{ parameters.jobName1 }}
+  displayName: ${{ parameters.displayValidationJob2 }}
+  pool: server
+  timeoutInMinutes: 4320 # job times out in 3 days
+  steps:
+  - task: ManualValidation@0
+    displayName: ${{ parameters.displayValidationJob2 }}
+    timeoutInMinutes: 2880 # 2 days
+    inputs:
+      instructions: ${{ parameters.instructionsValidationJob2 }}
+      onTimeout: reject
+
+- job: ${{ parameters.jobName2 }}
+  dependsOn: ${{ parameters.validationJob2 }}
+  pool:
+    name: ${{ parameters.poolName }}
+    demands:
+    - ImageOverride -equals ${{ parameters.imageOverride }}
+  displayName: ${{ parameters.displayNameJob2 }}
+  steps:
+  - checkout: none
+
+  - task: DownloadPipelineArtifact@2
+    displayName: Download ${{ parameters.packageName }} package artifact
+    inputs:
+      artifact: nupkg
+      patterns: '**/*.nupkg'
+      downloadPath: $(Pipeline.Workspace)/nuget
+
+  - pwsh: |
+      $packages = @(Get-ChildItem -Path '$(Pipeline.Workspace)/nuget' -Filter '${{ parameters.packageName }}.*.nupkg' -Recurse)
+      if ($packages.Count -ne 1) {
+          throw "Expected exactly one ${{ parameters.packageName }} package; found $($packages.Count): $($packages.Name -join ', ')"
+      }
+
+      $package = $packages[0].FullName
+      Write-Host "Package: $package"
+      $vstsCommandString = "vso[task.setvariable variable=NugetPkgPath]$package"
+      Write-Host "sending $vstsCommandString"
+      Write-Host "##$vstsCommandString"
+    displayName: Capture ${{ parameters.packageName }} package path and set environment variable
+
+  - task: NuGetCommand@2
+    displayName: Push ${{ parameters.packageName }} to NuGet.org
+    inputs:
+      command: push
+      packagesToPush: $(NugetPkgPath)
+      nuGetFeedType: external
+      publishFeedCredentials: ${{ parameters.serviceConnection2 }}
